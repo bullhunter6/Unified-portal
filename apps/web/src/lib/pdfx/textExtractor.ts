@@ -1,5 +1,14 @@
 import { PDFDocument } from "pdf-lib";
 import { createWorker } from "tesseract.js";
+import * as pdfjsLib from "pdfjs-dist";
+
+// Configure PDF.js for Node.js environment
+if (typeof globalThis.btoa === "undefined") {
+  globalThis.btoa = (str: string) => Buffer.from(str, "binary").toString("base64");
+}
+if (typeof globalThis.atob === "undefined") {
+  globalThis.atob = (str: string) => Buffer.from(str, "base64").toString("binary");
+}
 
 /**
  * Extract text from PDF buffer
@@ -9,22 +18,42 @@ export async function extractPdfText(buffer: Buffer): Promise<string[]> {
   const perPage: string[] = [];
   
   try {
-    // Load PDF to get page count
-    const pdfDoc = await PDFDocument.load(buffer);
-    const totalPages = pdfDoc.getPageCount();
+    // First try to extract text directly from PDF
+    const doc = await pdfjsLib.getDocument({
+      data: new Uint8Array(buffer),
+      useSystemFonts: true,
+      standardFontDataUrl: "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/standard_fonts/",
+    }).promise;
 
-    // For now, create meaningful placeholder text for each page
-    // This demonstrates the translation workflow without requiring complex PDF parsing
-    for (let i = 0; i < totalPages; i++) {
-      const pageContent = generateSampleContent(i + 1, totalPages);
-      perPage.push(pageContent);
+    const totalPages = doc.numPages;
+    console.log(`PDF has ${totalPages} pages`);
+
+    for (let i = 1; i <= totalPages; i++) {
+      const page = await doc.getPage(i);
+      const textContent = await page.getTextContent();
+      const pageText = textContent.items
+        .map((item: any) => item.str)
+        .join(" ")
+        .trim();
+
+      // If page has substantial text, use it
+      if (pageText.length > 50) {
+        perPage.push(pageText);
+        console.log(`Page ${i}: Extracted ${pageText.length} chars of text`);
+      } else {
+        // Page appears to be image-based, use OCR
+        console.log(`Page ${i}: Text extraction yielded minimal content (${pageText.length} chars), using OCR`);
+        const ocrText = await extractPageWithOCR(page);
+        perPage.push(ocrText || pageText || "");
+      }
     }
 
     return perPage;
   } catch (error) {
     console.error("Error extracting PDF text:", error);
-    // Fallback: single page with error message
-    return ["Error: Unable to process PDF. Please ensure the file is a valid PDF document."];
+    // Fallback: try pure OCR approach
+    console.log("Falling back to OCR-only extraction");
+    return await extractPdfTextWithOCR(buffer);
   }
 }
 
@@ -123,11 +152,60 @@ Note: This content represents extracted text from your uploaded PDF document. Th
 }
 
 /**
+ * Extract text from a single PDF page using OCR
+ */
+async function extractPageWithOCR(page: any): Promise<string> {
+  try {
+    const viewport = page.getViewport({ scale: 2.0 });
+    const { createCanvas } = await import("canvas");
+    const canvas = createCanvas(viewport.width, viewport.height);
+    const context = canvas.getContext("2d");
+
+    await page.render({
+      canvasContext: context,
+      viewport: viewport,
+    }).promise;
+
+    const imageBuffer = canvas.toBuffer("image/png");
+    
+    // Use Tesseract OCR
+    const worker = await createWorker("eng");
+    const { data: { text } } = await worker.recognize(imageBuffer);
+    await worker.terminate();
+
+    return text.trim();
+  } catch (error) {
+    console.error("OCR extraction failed:", error);
+    return "";
+  }
+}
+
+/**
  * Alternative OCR-based text extraction (for image-heavy PDFs)
  * This function would be used when standard PDF text extraction fails
  */
 export async function extractPdfTextWithOCR(buffer: Buffer): Promise<string[]> {
-  // This would implement OCR using tesseract.js
-  // For now, return placeholder indicating OCR capability
-  return ["OCR-based text extraction is available for image-based PDFs. This feature can be enabled for production use."];
+  const perPage: string[] = [];
+  
+  try {
+    const doc = await pdfjsLib.getDocument({
+      data: new Uint8Array(buffer),
+      useSystemFonts: true,
+    }).promise;
+
+    const totalPages = doc.numPages;
+    console.log(`OCR-only mode: Processing ${totalPages} pages`);
+
+    for (let i = 1; i <= totalPages; i++) {
+      const page = await doc.getPage(i);
+      const ocrText = await extractPageWithOCR(page);
+      perPage.push(ocrText || `[Page ${i} - No text detected]`);
+      console.log(`OCR Page ${i}/${totalPages}: Extracted ${ocrText.length} chars`);
+    }
+
+    return perPage;
+  } catch (error) {
+    console.error("Complete OCR extraction failed:", error);
+    return ["Error: Unable to process PDF with OCR. Please ensure Tesseract is installed."];
+  }
 }
