@@ -84,7 +84,19 @@ export async function extractAllPages(inputPath: string): Promise<PageRecord[]> 
 
 /**
  * OCR a single page to text with `ocrmypdf`, writing a sidecar .txt
- * (No canvas, no workers)
+ * Supports 100+ languages through Tesseract OCR
+ * 
+ * Languages configured (can be customized):
+ * - English, Arabic, Chinese (Simplified & Traditional)
+ * - Russian, Spanish, French, German
+ * - Japanese, Korean, Italian, Portuguese
+ * - Turkish, Vietnamese, Hindi, Uzbek (Latin & Cyrillic)
+ * 
+ * To add more languages:
+ * 1. Install language pack: sudo apt install tesseract-ocr-<lang>
+ * 2. Add to languages array below
+ * 
+ * See: https://tesseract-ocr.github.io/tessdoc/Data-Files-in-different-versions.html
  */
 
 // Extract a single page with OCR using ocrmypdf sidecar
@@ -125,6 +137,29 @@ export async function ocrPageToText(
     // Prefer singlePdf if exists; otherwise point to original with --pages
     const src = splitOkay ? singlePdf : inputPath;
 
+    // Use comprehensive language support for OCR
+    // This covers most major languages used in business documents
+    // You can customize this list based on your needs
+    const languages = [
+      'eng',        // English
+      'ara',        // Arabic
+      'chi_sim',    // Chinese Simplified
+      'chi_tra',    // Chinese Traditional
+      'rus',        // Russian
+      'spa',        // Spanish
+      'fra',        // French
+      'deu',        // German
+      'jpn',        // Japanese
+      'kor',        // Korean
+      'ita',        // Italian
+      'por',        // Portuguese
+      'tur',        // Turkish
+      'vie',        // Vietnamese
+      'hin',        // Hindi
+      'uzb',        // Uzbek (Latin)
+      'uzb_cyrl',   // Uzbek (Cyrillic)
+    ].join('+');
+
     const args = [
       src,
       path.join(workDir, `ocr_${pageNumber}.pdf`),
@@ -133,7 +168,7 @@ export async function ocrPageToText(
       '--jobs',
       '1',
       '-l',
-      'eng+uzb+uzb_cyrl',
+      languages,
       '--rotate-pages',
       '--deskew',
     ];

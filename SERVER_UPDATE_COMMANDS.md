@@ -70,14 +70,53 @@ tesseract --list-langs
 # Should include: eng, osd
 ```
 
-### 6. Install Additional Language Packs (For Uzbek support)
+### 6. Install Comprehensive Language Packs (All Major Languages)
 ```bash
-# If you need Uzbek language support as per your code
-sudo apt install -y tesseract-ocr-uzb tesseract-ocr-uzb-cyrl
+# Install ALL major language packs for OCR support
+# This enables text extraction from documents in any major language
+sudo apt install -y \
+  tesseract-ocr-ara \
+  tesseract-ocr-chi-sim \
+  tesseract-ocr-chi-tra \
+  tesseract-ocr-rus \
+  tesseract-ocr-spa \
+  tesseract-ocr-fra \
+  tesseract-ocr-deu \
+  tesseract-ocr-jpn \
+  tesseract-ocr-kor \
+  tesseract-ocr-ita \
+  tesseract-ocr-por \
+  tesseract-ocr-tur \
+  tesseract-ocr-vie \
+  tesseract-ocr-hin \
+  tesseract-ocr-uzb \
+  tesseract-ocr-uzb-cyrl
 
-# Verify
-tesseract --list-langs | grep uzb
+# Verify installed languages
+tesseract --list-langs
+
+# You should see:
+# ara (Arabic)
+# chi_sim (Chinese - Simplified)
+# chi_tra (Chinese - Traditional)
+# deu (German)
+# eng (English)
+# fra (French)
+# hin (Hindi)
+# ita (Italian)
+# jpn (Japanese)
+# kor (Korean)
+# por (Portuguese)
+# rus (Russian)
+# spa (Spanish)
+# tur (Turkish)
+# uzb (Uzbek Latin)
+# uzb_cyrl (Uzbek Cyrillic)
+# vie (Vietnamese)
+# ... and others
 ```
+
+**Note:** This installation may take 2-5 minutes and requires ~500MB disk space.
 
 ---
 
