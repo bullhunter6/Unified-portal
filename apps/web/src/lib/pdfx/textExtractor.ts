@@ -36,16 +36,37 @@ export async function extractPdfText(buffer: Buffer): Promise<string[]> {
         .join(" ")
         .trim();
 
-      // If page has substantial text, use it
-      if (pageText.length > 50) {
-        perPage.push(pageText);
-        console.log(`Page ${i}: Extracted ${pageText.length} chars of text`);
+      // Strategy: Always try OCR for comprehensive extraction
+      // Then combine with any extracted text for best results
+      console.log(`Page ${i}: Extracted ${pageText.length} chars of direct text, running OCR...`);
+      const ocrText = await extractPageWithOCR(page);
+      
+      // Combine both sources: direct text + OCR
+      let combinedText = "";
+      
+      if (pageText.length > 0 && ocrText.length > 0) {
+        // Both exist - combine them intelligently
+        // If OCR contains the direct text, use OCR only (avoid duplication)
+        if (ocrText.toLowerCase().includes(pageText.toLowerCase().substring(0, Math.min(50, pageText.length)))) {
+          combinedText = ocrText;
+          console.log(`Page ${i}: Using OCR text (${ocrText.length} chars) as it includes direct text`);
+        } else {
+          // Different content - combine both
+          combinedText = pageText + "\n\n" + ocrText;
+          console.log(`Page ${i}: Combined direct text + OCR (${combinedText.length} chars total)`);
+        }
+      } else if (ocrText.length > 0) {
+        combinedText = ocrText;
+        console.log(`Page ${i}: Using OCR text only (${ocrText.length} chars)`);
+      } else if (pageText.length > 0) {
+        combinedText = pageText;
+        console.log(`Page ${i}: Using direct text only (${pageText.length} chars)`);
       } else {
-        // Page appears to be image-based, use OCR
-        console.log(`Page ${i}: Text extraction yielded minimal content (${pageText.length} chars), using OCR`);
-        const ocrText = await extractPageWithOCR(page);
-        perPage.push(ocrText || pageText || "");
+        combinedText = `[Page ${i} - No text detected]`;
+        console.log(`Page ${i}: No text found`);
       }
+      
+      perPage.push(combinedText);
     }
 
     return perPage;
