@@ -1,0 +1,15 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "NAME": "Sample Country" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [0, 0], [10, 0], [10, 10], [0, 10], [0, 0]
+        ]]
+      }
+    }
+  ]
+}

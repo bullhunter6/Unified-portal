@@ -1,0 +1,36 @@
+{
+  "name": "portal-v3",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "pnpm -C apps/web dev",
+    "build": "pnpm db:generate && pnpm -C apps/web build",
+    "start": "pnpm -C apps/web start",
+    "lint": "pnpm -C apps/web lint",
+    "type-check": "pnpm -C apps/web tsc --noEmit",
+    "db:pull": "pnpm -C packages/db-esg pull && pnpm -C packages/db-credit pull",
+    "db:generate": "pnpm -C packages/db-esg generate && pnpm -C packages/db-credit generate",
+    "db:studio:esg": "pnpm -C packages/db-esg studio",
+    "db:studio:credit": "pnpm -C packages/db-credit studio",
+    "clean": "rm -rf node_modules apps/*/node_modules packages/*/node_modules apps/*/.next",
+    "audit": "pnpm audit --audit-level moderate",
+    "docker:build": "docker build -t portal-v3 .",
+    "docker:run": "docker-compose up -d",
+    "docker:stop": "docker-compose down",
+    "docker:logs": "docker-compose logs -f app",
+    "prod:check": "node scripts/production-check.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "@prisma/client": "5.22.0",
+      "prisma": "5.22.0",
+      "next-auth": "^4.24.7"
+    }
+  }
+}

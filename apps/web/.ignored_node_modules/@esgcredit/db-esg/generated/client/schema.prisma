@@ -1,0 +1,314 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model alembic_version {
+  version_num String @id(map: "alembic_version_pkc") @db.VarChar(32)
+}
+
+model esg_articles {
+  id               Int       @id @default(autoincrement())
+  title            String
+  published        DateTime? @db.Timestamptz(6)
+  summary          String?
+  link             String    @unique(map: "esg_articles_link_unique")
+  source           String?
+  matched_keywords String?
+  save_time        DateTime? @db.Timestamptz(6)
+}
+
+model events {
+  id             Int       @id @default(autoincrement())
+  event_name     String?
+  event_id       String?   @unique
+  event_url      String?
+  start_date     DateTime? @db.Date
+  end_date       DateTime? @db.Date
+  start_time     DateTime? @db.Time(6)
+  end_time       DateTime? @db.Time(6)
+  timezone       String?
+  image_url      String?
+  ticket_price   String?
+  tickets_url    String?
+  venue_name     String?
+  venue_address  String?
+  organizer_name String?
+  organizer_url  String?
+  summary        String?
+  tags           String?
+  source         String?
+  month          String?
+  created_at     DateTime? @default(now()) @db.Timestamp(6)
+
+  @@unique([event_name, start_date, source], map: "unique_event_composite")
+}
+
+model file_uploads {
+  id                Int       @id @default(autoincrement())
+  task_id           String    @unique @db.VarChar(36)
+  original_filename String    @db.VarChar(256)
+  stored_filename   String    @db.VarChar(256)
+  output_filename   String?   @db.VarChar(256)
+  status            String?   @db.VarChar(20)
+  error_message     String?
+  user_id           Int?
+  created_at        DateTime? @db.Timestamp(6)
+  updated_at        DateTime? @db.Timestamp(6)
+  users             users?    @relation(fields: [user_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+}
+
+model likes {
+  id           Int       @id @default(autoincrement())
+  user_id      Int
+  content_type String    @db.VarChar(20)
+  content_id   Int
+  created_at   DateTime? @db.Timestamp(6)
+  users        users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_likes_user_id")
+
+  @@unique([user_id, content_type, content_id], map: "unique_like")
+  @@index([content_type], map: "ix_likes_content_type")
+  @@index([user_id], map: "ix_likes_user_id")
+}
+
+model pdf_translation_jobs {
+  id               String    @id @db.Uuid
+  user_id          Int
+  filename         String
+  stored_filename  String
+  input_path       String
+  target_lang      String    @default("English")
+  status           String    @default("processing")
+  message          String?
+  progress         Int       @default(0)
+  total_pages      Int       @default(0)
+  current_page     Int       @default(0)
+  pages            Json      @default("[]")
+  translated_pages Json      @default("[]")
+  output_path      String?
+  created_at       DateTime  @default(now())
+  updated_at       DateTime  @updatedAt
+  completed_at     DateTime?
+  user             users     @relation(fields: [user_id], references: [id], onDelete: SetNull, map: "pdf_translation_jobs_user_id_fkey")
+
+  @@map("pdf_translation_jobs")
+}
+
+model pdf_translations {
+  id                Int                 @id @default(autoincrement())
+  job_id            String              @unique(map: "ix_pdf_translations_job_id") @db.VarChar(64)
+  user_id           Int
+  original_filename String              @db.VarChar(255)
+  file_path         String              @db.VarChar(500)
+  file_size         Int?
+  source_language   String?             @db.VarChar(10)
+  target_language   String              @db.VarChar(10)
+  total_pages       Int
+  total_words       Int?
+  status            String?             @db.VarChar(20)
+  created_at        DateTime?           @db.Timestamp(6)
+  started_at        DateTime?           @db.Timestamp(6)
+  completed_at      DateTime?           @db.Timestamp(6)
+  processing_time   Float?
+  success_pages     Int?
+  failed_pages      Int?
+  error_message     String?
+  ocr_method        String?             @db.VarChar(50)
+  users             users               @relation(fields: [user_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  translation_pages translation_pages[]
+}
+
+model publications {
+  id        Int       @id @default(autoincrement())
+  title     String
+  published DateTime? @db.Timestamptz(6)
+  summary   String?
+  link      String    @unique(map: "publications_link_unique")
+  source    String?
+  image_url String?
+  save_time DateTime? @db.Timestamptz(6)
+}
+
+model translation_history {
+  id                     Int       @id @default(autoincrement())
+  user_id                Int
+  total_translations     Int?
+  total_pages_processed  Int?
+  total_words_translated Int?
+  total_processing_time  Float?
+  most_used_source_lang  String?   @db.VarChar(10)
+  most_used_target_lang  String?   @db.VarChar(10)
+  first_translation      DateTime? @db.Timestamp(6)
+  last_translation       DateTime? @db.Timestamp(6)
+  last_updated           DateTime? @db.Timestamp(6)
+  users                  users     @relation(fields: [user_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+}
+
+model translation_pages {
+  id                    Int              @id @default(autoincrement())
+  translation_id        Int
+  page_number           Int
+  original_text         String?
+  translated_text       String?
+  original_word_count   Int?
+  translated_word_count Int?
+  extraction_method     String?          @db.VarChar(50)
+  processing_time       Float?
+  status                String?          @db.VarChar(20)
+  error_message         String?
+  created_at            DateTime?        @db.Timestamp(6)
+  pdf_translations      pdf_translations @relation(fields: [translation_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+}
+
+model user_preferences {
+  id                Int      @id @default(autoincrement())
+  user_id           Int?
+  preferred_sources String[]
+  preferred_topics  String[]
+  users             users?   @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+}
+
+model users {
+  id                   Int                    @id @default(autoincrement())
+  username             String                 @unique(map: "ix_users_username") @db.VarChar(255)
+  email                String?                @unique(map: "ix_users_email") @db.VarChar(255)
+  password             String?                @db.VarChar(255)
+  password_hash        String                 @db.VarChar(255)
+  first_name           String?                @db.VarChar(64)
+  last_name            String?                @db.VarChar(64)
+  is_admin             Boolean?               @default(false)
+  created_at           DateTime?              @default(now()) @db.Timestamp(6)
+  last_login           DateTime?              @db.Timestamp(6)
+  preferred_categories String?                @db.VarChar(256)
+  email_notifications  Boolean?               @default(true)
+  is_active_db         Boolean                @default(true)
+  team                 String?                @db.VarChar(100)
+  alert_history        alert_history[]
+  alert_preferences    alert_preferences[]
+  email_queue          email_queue[]
+  file_uploads         file_uploads[]
+  likes                likes[]
+  pdf_translation_jobs pdf_translation_jobs[]
+  pdf_translations     pdf_translations[]
+  translation_history  translation_history[]
+  user_preferences     user_preferences[]
+
+  @@index([team], map: "ix_users_team")
+}
+
+model alert_preferences {
+  id                      Int                  @id @default(autoincrement())
+  user_id                 Int
+  domain                  String               @db.VarChar(10)
+  weekly_digest           Boolean?             @default(true)
+  daily_digest            Boolean?             @default(false)
+  immediate_alerts        Boolean?             @default(false)
+  alert_articles          Boolean?             @default(true)
+  alert_events            Boolean?             @default(true)
+  alert_publications      Boolean?             @default(true)
+  sources                 String[]
+  keywords                String[]
+  team_likes_only         Boolean?             @default(true)
+  email_enabled           Boolean?             @default(true)
+  email_address           String?              @db.VarChar(255)
+  digest_day              String?              @default("Monday") @db.VarChar(10)
+  digest_hour             Int?                 @default(9)
+  timezone                String?              @default("Asia/Dubai") @db.VarChar(50)
+  created_at              DateTime?            @default(now()) @db.Timestamp(6)
+  updated_at              DateTime?            @default(now()) @updatedAt @db.Timestamp(6)
+  alert_name              String?              @default("My Alert") @db.VarChar(255)
+  alert_type              String?              @default("weekly_digest") @db.VarChar(50)
+  is_active               Boolean?             @default(true)
+  immediate_sources       String[]             @default([]) @db.VarChar(50)
+  immediate_keywords      String[]             @default([]) @db.VarChar(100)
+  immediate_content_types String[]             @default(["articles"]) @db.VarChar(50)
+  last_sent_at            DateTime?            @db.Timestamp(6)
+  next_send_at            DateTime?            @db.Timestamp(6)
+  domains                 String[]             @default([]) @db.VarChar(20)
+  alert_content_sent      alert_content_sent[]
+  users                   users                @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([alert_type], map: "idx_alert_preferences_alert_type")
+  @@index([is_active], map: "idx_alert_preferences_is_active")
+  @@index([next_send_at], map: "idx_alert_preferences_next_send_at")
+  @@index([user_id], map: "idx_alert_prefs_user")
+}
+
+model alert_history {
+  id               Int       @id @default(autoincrement())
+  user_id          Int
+  domain           String    @db.VarChar(10)
+  alert_type       String    @db.VarChar(20)
+  content_type     String?   @db.VarChar(20)
+  content_ids      Int[]
+  email_to         String    @db.VarChar(255)
+  email_subject    String?
+  email_status     String?   @default("pending") @db.VarChar(20)
+  total_items      Int?      @default(0)
+  opened_at        DateTime? @db.Timestamp(6)
+  clicked_at       DateTime? @db.Timestamp(6)
+  error_message    String?
+  retry_count      Int?      @default(0)
+  sent_at          DateTime? @db.Timestamp(6)
+  created_at       DateTime? @default(now()) @db.Timestamp(6)
+  template_version String?   @db.VarChar(10)
+  job_id           String?   @db.VarChar(100)
+  users            users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([domain], map: "idx_alert_history_domain")
+  @@index([sent_at(sort: Desc)], map: "idx_alert_history_sent")
+  @@index([email_status], map: "idx_alert_history_status")
+  @@index([alert_type], map: "idx_alert_history_type")
+  @@index([user_id], map: "idx_alert_history_user")
+}
+
+model email_queue {
+  id              Int       @id @default(autoincrement())
+  user_id         Int
+  email_to        String    @db.VarChar(255)
+  email_subject   String
+  email_body      String
+  email_html      String?
+  priority        Int?      @default(5)
+  scheduled_for   DateTime  @db.Timestamp(6)
+  status          String?   @default("queued") @db.VarChar(20)
+  attempts        Int?      @default(0)
+  max_attempts    Int?      @default(3)
+  last_error      String?
+  last_attempt_at DateTime? @db.Timestamp(6)
+  sent_at         DateTime? @db.Timestamp(6)
+  processed_by    String?   @db.VarChar(100)
+  created_at      DateTime? @default(now()) @db.Timestamp(6)
+  updated_at      DateTime? @default(now()) @db.Timestamp(6)
+  alert_type      String?   @db.VarChar(20)
+  domain          String?   @db.VarChar(10)
+  metadata        Json?
+  users           users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([priority(sort: Desc), scheduled_for], map: "idx_email_queue_priority")
+  @@index([scheduled_for], map: "idx_email_queue_scheduled")
+  @@index([status], map: "idx_email_queue_status")
+  @@index([user_id], map: "idx_email_queue_user")
+}
+
+model alert_content_sent {
+  id                  Int               @id @default(autoincrement())
+  alert_preference_id Int
+  domain              String            @db.VarChar(20)
+  content_type        String            @db.VarChar(20)
+  content_id          Int
+  content_save_time   DateTime?         @db.Timestamp(6)
+  sent_at             DateTime?         @default(now()) @db.Timestamp(6)
+  alert_preferences   alert_preferences @relation(fields: [alert_preference_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_alert_content_alert_pref")
+
+  @@unique([alert_preference_id, domain, content_type, content_id], name: "unique_alert_content", map: "unique_alert_content")
+  @@index([domain, content_type, content_id], map: "idx_alert_content_composite")
+  @@index([alert_preference_id], map: "idx_alert_content_alert_id")
+  @@index([domain], map: "idx_alert_content_domain")
+  @@index([sent_at], map: "idx_alert_content_sent_at")
+}

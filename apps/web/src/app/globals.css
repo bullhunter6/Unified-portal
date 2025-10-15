@@ -1,0 +1,239 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* --- Shadcn/Tailwind design tokens --- */
+:root {
+  --background: 0 0% 100%;
+  --foreground: 222 84% 4%;
+
+  --card: 0 0% 100%;                 /* visible light surface */
+  --card-foreground: 222 84% 4%;
+
+  --popover: 0 0% 100%;
+  --popover-foreground: 222 84% 4%;
+
+  --primary: 142 76% 36%;            /* ESG green */
+  --primary-foreground: 355 100% 97%;
+
+  --secondary: 210 40% 96%;
+  --secondary-foreground: 222 47% 11%;
+
+  --muted: 210 40% 96%;
+  --muted-foreground: 215 16% 47%;
+
+  --accent: 210 40% 98%;            /* subtle green tint for ESG */
+  --accent-foreground: 222 47% 11%;
+
+  --destructive: 0 84% 60%;
+  --destructive-foreground: 210 40% 98%;
+
+  --border: 214 32% 91%;
+  --input: 214 32% 91%;
+  --ring: 142 76% 36%;
+}
+
+.dark {
+  --background: 222 84% 4%;
+  --foreground: 210 40% 98%;
+
+  --card: 222 47% 11%;                 /* visible dark surface */
+  --card-foreground: 210 40% 98%;
+
+  --popover: 222 84% 4%;
+  --popover-foreground: 210 40% 98%;
+
+  --primary: 142 76% 36%;            /* ESG green in dark */
+  --primary-foreground: 355 100% 97%;
+
+  --secondary: 217 32% 17%;
+  --secondary-foreground: 210 40% 98%;
+
+  --muted: 215 27% 17%;
+  --muted-foreground: 215 20% 65%;
+
+  --accent: 215 27% 17%;              /* dark accent */
+  --accent-foreground: 210 40% 98%;
+
+  --destructive: 0 62% 30%;
+  --destructive-foreground: 210 40% 98%;
+
+  --border: 215 27% 17%;
+  --input: 215 27% 17%;
+  --ring: 142 76% 36%;
+}
+
+/* Credit domain uses blue accent */
+[data-domain="credit"] {
+  --primary: 217 91% 60%;             /* blue for Credit */
+  --ring: 217 91% 60%;
+  --accent: 213 97% 87%;            /* light blue tint */
+}
+
+/* Generic component helpers */
+@layer components {
+  .card {
+    @apply bg-card text-card-foreground border border-border shadow-card rounded-2xl;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2 text-sm font-medium transition;
+  }
+  .btn-primary {
+    @apply btn bg-primary text-primary-foreground hover:bg-accent focus:ring-2 focus:ring-ring/60;
+  }
+  .btn-ghost {
+    @apply btn bg-transparent hover:bg-accent/10 text-foreground;
+  }
+  .badge {
+    @apply inline-flex items-center rounded-lg px-2 py-0.5 text-xs font-medium bg-secondary/70 text-secondary-foreground;
+  }
+}
+
+/* Component Utilities */
+.surface {
+  background-color: var(--surface);
+  border: 1px solid var(--border);
+}
+
+.surface-2 {
+  background-color: var(--surface-2);
+  border: 1px solid var(--border-muted);
+}
+
+.card {
+  background-color: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  transition: box-shadow 200ms ease, transform 200ms ease, border-color 200ms ease;
+}
+
+.card:hover {
+  box-shadow: var(--shadow-md);
+  transform: translateY(-2px);
+  border-color: var(--brand);
+}
+
+.glass {
+  background-color: color-mix(in oklch, var(--surface) 85%, transparent);
+  backdrop-filter: blur(12px);
+  border: 1px solid color-mix(in oklch, var(--border) 50%, transparent);
+}
+
+.focus-ring {
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+}
+
+.focus-ring:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+/* Text Utilities */
+.text-brand {
+  color: var(--brand);
+}
+
+.text-muted {
+  color: var(--text-muted);
+}
+
+.text-subtle {
+  color: var(--text-subtle);
+}
+
+/* Hover Animations */
+.hover-lift {
+  transition: transform 200ms ease, box-shadow 200ms ease;
+}
+
+.hover-lift:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-lg);
+}
+
+.hover-scale {
+  transition: transform 150ms ease;
+}
+
+.hover-scale:hover {
+  transform: scale(1.02);
+}
+
+/* Button Styles */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  font-weight: 600;
+  transition: all 150ms ease;
+  cursor: pointer;
+}
+
+.btn-primary {
+  background-color: var(--brand);
+  color: var(--brand-contrast);
+  border: 1px solid var(--brand);
+}
+
+.btn-primary:hover {
+  background-color: color-mix(in oklch, var(--brand) 90%, black);
+  transform: translateY(-0.5px);
+}
+
+.btn-secondary {
+  background-color: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.btn-secondary:hover {
+  background-color: var(--surface-3);
+  border-color: var(--brand);
+}
+
+/* Animation Utilities */
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes float {
+  0%, 100% {
+    transform: translateY(0px);
+  }
+  50% {
+    transform: translateY(-10px);
+  }
+}
+
+.animate-fade-in-up {
+  animation: fadeInUp 300ms ease forwards;
+}
+
+.animate-stagger-1 { animation-delay: 20ms; }
+.animate-stagger-2 { animation-delay: 40ms; }
+.animate-stagger-3 { animation-delay: 60ms; }
+.animate-stagger-4 { animation-delay: 80ms; }
+.animate-stagger-5 { animation-delay: 100ms; }
+.animate-stagger-6 { animation-delay: 120ms; }
+
+/* Reduced Motion */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
