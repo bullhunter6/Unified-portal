@@ -27,6 +27,7 @@ function looksLikeScanned(text: string) {
 }
 
 export async function extractPdfTextBuffer(fileBuf: Buffer): Promise<PageText[]> {
+  console.log('[extractPdfTextBuffer] Starting extraction, buffer size:', fileBuf.length);
   stubGraphicsIfNeeded();
 
   const pdfjs = await import('pdfjs-dist/legacy/build/pdf.js');
@@ -42,6 +43,7 @@ export async function extractPdfTextBuffer(fileBuf: Buffer): Promise<PageText[]>
 
   const doc = await loadingTask.promise;
   const total = doc.numPages;
+  console.log('[extractPdfTextBuffer] PDF loaded, total pages:', total);
   const pages: PageText[] = [];
 
   for (let i = 1; i <= total; i++) {
@@ -61,16 +63,23 @@ export async function extractPdfTextBuffer(fileBuf: Buffer): Promise<PageText[]>
 }
 
 export async function extractAllPages(inputPath: string): Promise<PageRecord[]> {
+  console.log('[extractAllPages] Reading file:', inputPath);
   const data = await fs.readFile(inputPath);
+  console.log('[extractAllPages] File read successfully, size:', data.length);
   const pageTexts = await extractPdfTextBuffer(data);
+  console.log('[extractAllPages] Extracted text from', pageTexts.length, 'pages');
   
-  return pageTexts.map(({ pageNumber, text }) => ({
-    pageNumber,
-    originalText: normalize(text),
-    translatedText: undefined,
-    needsOcr: looksLikeScanned(text),
-    status: 'pending' as const,
-  }));
+  return pageTexts.map(({ pageNumber, text }) => {
+    const needsOcr = looksLikeScanned(text);
+    console.log(`[extractAllPages] Page ${pageNumber}: text length=${text.length}, needsOcr=${needsOcr}`);
+    return {
+      pageNumber,
+      originalText: normalize(text),
+      translatedText: undefined,
+      needsOcr,
+      status: 'pending' as const,
+    };
+  });
 }
 
 /**

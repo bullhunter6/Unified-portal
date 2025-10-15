@@ -67,10 +67,13 @@ export async function startPdfJob(
   // run in background (don't await here in route)
   (async () => {
     try {
+      console.log(`[PDF Job ${jobId}] Starting job for file: ${filename}`);
       JobStore.update(jobId, { message: 'Analyzing PDF…', progress: 5 });
 
       // 1) Extract all pages (initial text + OCR flags)
+      console.log(`[PDF Job ${jobId}] Extracting pages from: ${inputPath}`);
       let pages = await extractAllPages(inputPath);
+      console.log(`[PDF Job ${jobId}] Extracted ${pages.length} pages`);
       JobStore.update(jobId, {
         totalPages: pages.length,
         pages,
@@ -89,6 +92,7 @@ export async function startPdfJob(
 
       // 2) For pages flagged needsOcr, run OCR page-wise
       const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pdfx-'));
+      console.log(`[PDF Job ${jobId}] OCR work directory: ${workDir}`);
       for (let i = 0; i < pages.length; i++) {
         const p = pages[i];
         if (JobStore.get(jobId)?.stopRequested) throw new Error('Job stopped');
@@ -100,8 +104,10 @@ export async function startPdfJob(
         });
 
         if (p.needsOcr || !p.originalText?.trim()) {
+          console.log(`[PDF Job ${jobId}] Running OCR on page ${p.pageNumber}...`);
           const txt = await ocrPageToText(inputPath, p.pageNumber, workDir);
           p.originalText = txt || p.originalText || '';
+          console.log(`[PDF Job ${jobId}] OCR completed for page ${p.pageNumber}, text length: ${txt.length}`);
         }
         p.status = 'extracted';
         JobStore.update(jobId, { pages: [...pages] });
@@ -113,6 +119,7 @@ export async function startPdfJob(
       });
 
       // 3) Translate each page
+      console.log(`[PDF Job ${jobId}] Starting translation to ${targetLang}...`);
       for (let i = 0; i < pages.length; i++) {
         const p = pages[i];
         if (JobStore.get(jobId)?.stopRequested) throw new Error('Job stopped');
@@ -124,9 +131,11 @@ export async function startPdfJob(
         });
 
         const safeSource = p.originalText || '';
+        console.log(`[PDF Job ${jobId}] Translating page ${p.pageNumber}, source length: ${safeSource.length}`);
         const translated = await translatePage(safeSource, targetLang);
         p.translatedText = translated;
         p.status = 'translated';
+        console.log(`[PDF Job ${jobId}] Translation completed for page ${p.pageNumber}, length: ${translated.length}`);
 
         JobStore.update(jobId, { pages: [...pages] });
 
@@ -140,9 +149,11 @@ export async function startPdfJob(
       }
 
       // 4) Build translated PDF
+      console.log(`[PDF Job ${jobId}] Building translated PDF...`);
       JobStore.update(jobId, { message: 'Building translated PDF…', progress: 95 });
       const outPath = path.join(outputsDir, `${jobId}_translated.pdf`);
       await buildTranslatedPdf(pages, outPath);
+      console.log(`[PDF Job ${jobId}] PDF built successfully: ${outPath}`);
 
       JobStore.update(jobId, {
         status: 'completed',
@@ -163,6 +174,8 @@ export async function startPdfJob(
       });
     } catch (err: any) {
       const msg = err?.message || 'Translation failed';
+      console.error(`[PDF Job ${jobId}] ERROR:`, err);
+      console.error(`[PDF Job ${jobId}] Stack trace:`, err?.stack);
       JobStore.update(jobId, {
         status: 'error',
         message: msg,
@@ -174,4 +187,6 @@ export async function startPdfJob(
       });
     }
   })();
+  
+  console.log(`[PDF Job ${jobId}] Background job initiated`);
 }
