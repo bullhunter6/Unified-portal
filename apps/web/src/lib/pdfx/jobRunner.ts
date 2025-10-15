@@ -6,6 +6,18 @@ import { ensureFolders, jobInputPath } from "./fs";
 import { extractPdfText } from "./textExtractor";
 
 /**
+ * Sanitize text to remove null bytes and other problematic characters
+ * that PostgreSQL text fields cannot handle
+ */
+function sanitizeText(text: string): string {
+  if (!text) return "";
+  // Remove null bytes (\u0000) and other control characters except newlines and tabs
+  return text
+    .replace(/\u0000/g, "") // Remove null bytes
+    .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, ""); // Remove other control chars except \t, \n, \r
+}
+
+/**
  * Simple in-memory registry so we can cancel jobs.
  */
 type JobState = { cancelled?: boolean; running?: boolean };
@@ -68,7 +80,7 @@ export async function startPdfJob(job: {
   for (let i = 0; i < perPage.length; i++) {
     if (isCancelled(job.id)) break;
     current = i + 1;
-    const original_text = perPage[i] || "";
+    const original_text = sanitizeText(perPage[i] || "");
 
     await (prisma as any).pdf_translation_jobs.update({
       where: { id: job.id },
@@ -89,13 +101,15 @@ export async function startPdfJob(job: {
         const chunks = chunkText(original_text, 3000);
         const outs: string[] = [];
         for (const ch of chunks) {
-          outs.push(await translateChunk(ch, job.target_lang || "English"));
+          const translatedChunk = await translateChunk(ch, job.target_lang || "English");
+          outs.push(sanitizeText(translatedChunk));
           // small delay helps prevent rate-limits across many pages
           await new Promise((r) => setTimeout(r, 200));
         }
         translated_text = outs.join("\n\n");
       } else {
-        translated_text = await translateChunk(original_text, job.target_lang || "English");
+        const translatedChunk = await translateChunk(original_text, job.target_lang || "English");
+        translated_text = sanitizeText(translatedChunk);
       }
     }
 
