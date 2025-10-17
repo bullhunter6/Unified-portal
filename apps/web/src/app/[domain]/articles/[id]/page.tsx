@@ -9,6 +9,7 @@ import { parseKeywords } from "@/lib/keywords";
 import Link from "next/link";
 import { ArrowLeft, ExternalLink, Calendar, Building2, Heart, Users, Sparkles, Leaf, Shield, User2, Clock } from "lucide-react";
 import SafeHTMLContent from "@/components/SafeHTMLContent";
+import ArticleAssistant from "@/components/articles/ArticleAssistant";
 
 async function fetchArticle(domain: "esg" | "credit", id: string) {
   const prisma = getPrisma(domain);
@@ -118,22 +119,35 @@ export default async function ArticleDetail({
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50 to-green-50">
-      <div className="mx-auto max-w-6xl px-6 py-8">
-        {/* Header with Back Navigation */}
-        <div className="mb-8">
-          <Link 
-            href={`/${params.domain}/articles`}
-            className="inline-flex items-center gap-2 text-gray-600 hover:text-gray-900 transition-colors mb-6"
-          >
-            <ArrowLeft className="w-4 h-4" />
-            <span className="font-medium">Back to Articles</span>
-          </Link>
+      {/* Header with Back Navigation - Full Width */}
+      <div className="px-6 py-4 bg-white border-b border-gray-200 shadow-sm">
+        <Link 
+          href={`/${params.domain}/articles`}
+          className="inline-flex items-center gap-2 text-gray-600 hover:text-gray-900 transition-colors"
+        >
+          <ArrowLeft className="w-4 h-4" />
+          <span className="font-medium">Back to Articles</span>
+        </Link>
+      </div>
+
+      {/* Main Content: 40% Agent + 60% Article */}
+      <div className="flex h-[calc(100vh-64px)]">
+        {/* Agent - 40% */}
+        <div className="w-[40%] h-full">
+          <ArticleAssistant
+            articleId={Number(params.id)}
+            domain={params.domain}
+            articleTitle={item.title ?? "Untitled"}
+          />
         </div>
 
-        {/* Article Header */}
-        <div className="bg-white rounded-2xl shadow-xl border border-gray-100 overflow-hidden mb-8">
-          {/* Hero Section */}
-          <div className={`bg-gradient-to-r ${getESGColor()} p-8 text-white`}>
+        {/* Article - 60% */}
+        <div className="w-[60%] h-full overflow-y-auto bg-gray-50 scrollbar-thin scrollbar-thumb-gray-300 scrollbar-track-gray-100 p-4">
+          <div className="bg-white rounded-2xl shadow-lg overflow-hidden mb-4">
+            {/* Article Header Card */}
+            <div className="border-b border-gray-100">
+              {/* Hero Section */}
+              <div className={`bg-gradient-to-r ${getESGColor()} p-8 text-white rounded-t-2xl`}>
             <div className="flex items-start gap-6">
               <div className="flex-shrink-0">
                 <div className="w-16 h-16 bg-white/20 rounded-2xl flex items-center justify-center backdrop-blur-sm">
@@ -251,48 +265,15 @@ export default async function ArticleDetail({
               </div>
             )}
           </div>
-        </div>
-
-        {/* AI Summary */}
-        {params.domain === "esg" && providerReady && body && (
-          <div className="mb-8">
-            <Suspense fallback={
-              <div className="bg-white rounded-2xl shadow-lg border border-gray-100 p-8">
-                <div className="flex items-center gap-3 mb-4">
-                  <div className="w-10 h-10 bg-gradient-to-r from-purple-500 to-pink-500 rounded-xl flex items-center justify-center">
-                    <Sparkles className="w-5 h-5 text-white animate-pulse" />
-                  </div>
-                  <div>
-                    <h3 className="text-lg font-semibold text-gray-900">AI Summary</h3>
-                    <p className="text-gray-600">Generating intelligent summary...</p>
-                  </div>
-                </div>
-                <div className="animate-pulse bg-gray-200 h-20 rounded-xl"></div>
-              </div>
-            }>
-              <Summarizer body={body} />
-            </Suspense>
           </div>
-        )}
 
-        {/* Article Content */}
-        <div className="bg-white rounded-2xl shadow-lg border border-gray-100 overflow-hidden">
+          {/* Article Content */}
           <div className="p-8">
-            <div className="flex items-center gap-3 mb-6">
-              <div className="w-10 h-10 bg-gray-100 rounded-xl flex items-center justify-center">
-                <Building2 className="w-5 h-5 text-gray-600" />
-              </div>
-              <div>
-                <h3 className="text-lg font-semibold text-gray-900">Article Content</h3>
-                <p className="text-gray-600">Full article details and insights</p>
-              </div>
-            </div>
-
-            <article className="prose prose-lg prose-gray max-w-none prose-headings:text-gray-900 prose-p:text-gray-800 prose-p:leading-relaxed prose-p:mb-4 prose-a:text-blue-600 prose-a:font-medium hover:prose-a:text-blue-700 hover:prose-a:underline prose-strong:text-gray-900 prose-em:text-gray-700 prose-ul:text-gray-800 prose-ol:text-gray-800 prose-li:mb-2">
+            <article className="prose prose-lg prose-gray max-w-none">
               {body ? (
                 <SafeHTMLContent 
                   htmlContent={body}
-                  className="article-content text-gray-800 leading-relaxed [&>p]:mb-4 [&>p]:leading-7 [&>h1]:text-2xl [&>h1]:font-bold [&>h1]:text-gray-900 [&>h1]:mb-4 [&>h2]:text-xl [&>h2]:font-semibold [&>h2]:text-gray-900 [&>h2]:mb-3 [&>h3]:text-lg [&>h3]:font-semibold [&>h3]:text-gray-900 [&>h3]:mb-3 [&_a]:text-blue-600 [&_a]:font-medium [&_a]:border-b [&_a]:border-blue-200 hover:[&_a]:text-blue-700 hover:[&_a]:border-blue-300 [&_a]:transition-colors [&_a]:pb-0.5 [&>strong]:font-semibold [&>strong]:text-gray-900 [&>em]:italic [&>em]:text-gray-700 [&>ul]:list-disc [&>ul]:ml-6 [&>ul]:mb-4 [&>ol]:list-decimal [&>ol]:ml-6 [&>ol]:mb-4 [&>li]:mb-1 [&>blockquote]:border-l-4 [&>blockquote]:border-blue-200 [&>blockquote]:pl-4 [&>blockquote]:py-2 [&>blockquote]:bg-blue-50 [&>blockquote]:text-gray-700 [&>blockquote]:italic"
+                  className="article-content text-gray-800 leading-relaxed"
                 />
               ) : (
                 <div className="text-center py-12 bg-gray-50 rounded-xl">
@@ -302,6 +283,7 @@ export default async function ArticleDetail({
                 </div>
               )}
             </article>
+          </div>
           </div>
         </div>
       </div>

@@ -26,6 +26,7 @@ export async function GET(req: NextRequest) {
       activeAlerts,
       recentUsers,
       emailStats,
+      aiAssistantStats,
     ] = await Promise.all([
       // Total users
       esgPrisma.users.count(),
@@ -77,6 +78,45 @@ export async function GET(req: NextRequest) {
         by: ['status'],
         _count: true,
       }),
+
+      // AI Assistant stats (last 30 days)
+      esgPrisma.article_ai_sessions.aggregate({
+        where: {
+          created_at: {
+            gte: thirtyDaysAgo,
+          },
+        },
+        _count: true,
+        _sum: {
+          tokens_used: true,
+          cost_usd: true,
+        },
+      }).then(async (data) => {
+        const uniqueUsers = await esgPrisma.article_ai_sessions.findMany({
+          where: {
+            created_at: {
+              gte: thirtyDaysAgo,
+            },
+          },
+          select: { user_id: true },
+          distinct: ['user_id'],
+        });
+
+        const activeSessions = await esgPrisma.article_ai_sessions.count({
+          where: {
+            created_at: {
+              gte: new Date(now.getTime() - 60 * 60 * 1000), // Last hour
+            },
+          },
+        });
+
+        return {
+          totalSessions: data._count || 0,
+          activeSessions,
+          uniqueUsers: uniqueUsers.length,
+          totalCost: Number(data._sum?.cost_usd || 0),
+        };
+      }),
     ]);
 
     // Process email stats
@@ -97,6 +137,7 @@ export async function GET(req: NextRequest) {
         sent: emailStatsMap['sent'] || 0,
         failed: emailStatsMap['failed'] || 0,
       },
+      aiAssistant: aiAssistantStats,
     });
   } catch (error: any) {
     console.error("Error fetching stats:", error);

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 
 interface Stats {
   totalUsers: number;
@@ -19,6 +20,12 @@ interface Stats {
     queued: number;
     sent: number;
     failed: number;
+  };
+  aiAssistant?: {
+    totalSessions: number;
+    activeSessions: number;
+    uniqueUsers: number;
+    totalCost: number;
   };
 }
 
@@ -70,6 +77,7 @@ export default function AdminDashboard() {
       icon: "👥",
       color: "blue",
       change: `+${stats.newUsersThisWeek} this week`,
+      link: "/admin/users",
     },
     {
       title: "Active Users",
@@ -77,6 +85,7 @@ export default function AdminDashboard() {
       icon: "✅",
       color: "green",
       subtitle: "Last 30 days",
+      link: "/admin/users",
     },
     {
       title: "Total Alerts",
@@ -84,6 +93,7 @@ export default function AdminDashboard() {
       icon: "🔔",
       color: "purple",
       subtitle: `${stats.activeAlerts} active`,
+      link: "/admin/alerts",
     },
     {
       title: "Email Queue",
@@ -91,6 +101,18 @@ export default function AdminDashboard() {
       icon: "📧",
       color: "orange",
       subtitle: `${stats.emailStats.sent} sent, ${stats.emailStats.failed} failed`,
+      link: "/admin/email-queue",
+    },
+    {
+      title: "AI Assistant",
+      value: stats.aiAssistant?.totalSessions || 0,
+      icon: "🤖",
+      color: "indigo",
+      subtitle: stats.aiAssistant
+        ? `${stats.aiAssistant.uniqueUsers} users • $${stats.aiAssistant.totalCost.toFixed(2)}`
+        : "No data yet",
+      link: "/admin/ai-assistant",
+      highlight: true,
     },
   ];
 
@@ -104,26 +126,46 @@ export default function AdminDashboard() {
       </div>
 
       {/* Stats Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
-        {statCards.map((card) => (
-          <div
-            key={card.title}
-            className="bg-white rounded-lg shadow-sm border border-gray-200 p-6 hover:shadow-md transition-shadow"
-          >
-            <div className="flex items-center justify-between mb-4">
-              <span className="text-3xl">{card.icon}</span>
-              <div
-                className={`px-3 py-1 rounded-full text-xs font-medium bg-${card.color}-100 text-${card.color}-700`}
-              >
-                {card.subtitle || card.change}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-6 mb-8">
+        {statCards.map((card) => {
+          const cardContent = (
+            <div
+              className={`bg-white rounded-lg shadow-sm border p-6 hover:shadow-md transition-all ${
+                card.link ? "cursor-pointer" : ""
+              } ${
+                card.highlight
+                  ? "border-indigo-300 ring-2 ring-indigo-100"
+                  : "border-gray-200"
+              }`}
+            >
+              <div className="flex items-center justify-between mb-4">
+                <span className="text-3xl">{card.icon}</span>
+                <div
+                  className={`px-3 py-1 rounded-full text-xs font-medium bg-${card.color}-100 text-${card.color}-700`}
+                >
+                  {card.subtitle || card.change}
+                </div>
               </div>
+              <h3 className="text-gray-600 text-sm font-medium mb-1">
+                {card.title}
+              </h3>
+              <p className="text-3xl font-bold text-gray-900">{card.value}</p>
+              {card.link && (
+                <div className="mt-3 text-xs text-gray-500 flex items-center">
+                  View details →
+                </div>
+              )}
             </div>
-            <h3 className="text-gray-600 text-sm font-medium mb-1">
-              {card.title}
-            </h3>
-            <p className="text-3xl font-bold text-gray-900">{card.value}</p>
-          </div>
-        ))}
+          );
+
+          return card.link ? (
+            <Link key={card.title} href={card.link}>
+              {cardContent}
+            </Link>
+          ) : (
+            <div key={card.title}>{cardContent}</div>
+          );
+        })}
       </div>
 
       {/* Recent Users */}

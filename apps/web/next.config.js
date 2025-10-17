@@ -4,7 +4,15 @@ const nextConfig = {
   transpilePackages: ['@esgcredit/db-esg', '@esgcredit/db-credit'],
   experimental: {
     instrumentationHook: true, // Enable instrumentation for background workers
-    serverComponentsExternalPackages: ['@prisma/client', 'prisma', 'pdfjs-dist'], // let Next bundle it safely
+    serverComponentsExternalPackages: [
+      '@prisma/client', 
+      'prisma', 
+      'pdfjs-dist',
+      '@langchain/core',
+      '@langchain/openai',
+      'langchain',
+      '@langchain/langgraph'
+    ], // let Next bundle it safely
     esmExternals: 'loose',
   },
   webpack: (config, { isServer }) => {

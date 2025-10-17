@@ -15,7 +15,7 @@ export type EventRow = {
   // ESG fields
   event_id?: string;
   event_name?: string;
-  event_url?: string;
+  event_url?: string ;
   start_date?: string | null;
   end_date?: string | null;
   start_time?: string | null;

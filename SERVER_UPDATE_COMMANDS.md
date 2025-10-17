@@ -267,13 +267,16 @@ pnpm db:generate
 ```bash
 cd apps/web
 pnpm build
+cd ../..
 ```
 
 **Wait for successful build completion.**
 
-### 15. Return to Root and Update Ecosystem Config
+### 15. Verify Ecosystem Config
 ```bash
-cd /var/www/portal-v1.0.3
+# You should now be in /var/www/portal-v1.0.3
+pwd
+# Expected: /var/www/portal-v1.0.3
 
 # Verify ecosystem config has correct name
 cat ecosystem.config.js | grep name

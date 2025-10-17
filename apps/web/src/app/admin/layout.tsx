@@ -17,6 +17,7 @@ export default function AdminLayout({
   const navigation = [
     { name: "Dashboard", href: "/admin", icon: "📊" },
     { name: "User Management", href: "/admin/users", icon: "👥" },
+    { name: "AI Assistant Stats", href: "/admin/ai-assistant", icon: "🤖" },
     { name: "Alert Management", href: "/admin/alerts", icon: "🔔" },
     { name: "Email Queue", href: "/admin/email-queue", icon: "📧" },
     { name: "Content Moderation", href: "/admin/content", icon: "🛡️" },
