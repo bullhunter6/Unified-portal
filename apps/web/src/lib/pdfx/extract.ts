@@ -3,7 +3,6 @@
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { execa } from 'execa';
 import { getPdfJsStandardFontDataUrl } from '@/lib/pdfjs-node';
 import type { PageRecord } from './types';
 
@@ -32,6 +31,12 @@ const MAX_SPARSE_TEXT_AREA_RATIO = 0.02;
 const MIN_RASTER_PAGE_COVERAGE = 0.65;
 export const DEFAULT_OCR_LANGUAGES = 'eng+ara+uzb_cyrl';
 let ocrEnvironmentPromise: Promise<NodeJS.ProcessEnv | undefined> | undefined;
+let execaModulePromise: Promise<typeof import('execa')> | undefined;
+
+async function loadExeca() {
+  const execaModule = await (execaModulePromise ??= import('execa'));
+  return execaModule.execa;
+}
 
 function stubGraphicsIfNeeded() {
   // Avoid pdfjs trying to polyfill DOMMatrix/Path2D via node-canvas
@@ -577,6 +582,7 @@ export async function ocrPageToText(
     throw new Error('PDFX_OCR_LANGUAGES contains an invalid Tesseract language list');
   }
   const ocrEnvironment = await getOcrProcessEnvironment();
+  const execa = await loadExeca();
 
   try {
     await execa('qpdf', ['--empty', '--pages', inputPath, String(pageNumber), '--', singlePdf], {

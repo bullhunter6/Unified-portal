@@ -1,814 +1,582 @@
-# AWS EC2 Deployment Guide
+# Deployment Guide
 
-## Complete Step-by-Step Deployment Process
+Production deployment for the ESG/Credit Portal on **AWS EC2 (Amazon Linux 2023)**.
 
-This guide documents the complete deployment process for the ESG/Credit Portal on AWS EC2 Ubuntu 22.04.
-
----
-
-## Table of Contents
-1. [Prerequisites](#prerequisites)
-2. [Initial Server Setup](#initial-server-setup)
-3. [Application Deployment](#application-deployment)
-4. [PM2 Configuration](#pm2-configuration)
-5. [Verification](#verification)
-6. [Deploying New Versions](#deploying-new-versions)
-7. [Troubleshooting](#troubleshooting)
+**The production server never compiles.** GitHub Actions builds `apps/web/.next`
+and publishes it as a Release asset; the server downloads it. This is not a
+preference - `next build` needs 2-4 GB and the deploy runs while PM2 is still
+serving the previous version, so building on a 4 GB box gets OOM-killed.
 
 ---
 
-## Prerequisites
+## Table of contents
 
-### Local Machine
-- Git repository: https://github.com/saikrishna-pashapu2/Unified-portal.git
-- All environment variables ready (database URLs, API keys, etc.)
-
-### AWS EC2 Instance
-- **Instance Type**: t3.medium or higher
-- **OS**: Ubuntu Server 22.04 LTS
-- **Public IP**: Your EC2 public IP (example: 51.112.164.164)
-- **Security Group**: 
-  - Port 22 (SSH) - Your IP only
-  - Port 3000 (Application) - 0.0.0.0/0 (or specific IPs)
-  - Outbound: All traffic allowed
-
-### AWS RDS
-- PostgreSQL instances for ESG and Credit databases
-- Security group allowing connections from EC2 security group
-
-### GitHub Actions (builds the deployed artifact)
-
-The server no longer compiles. `.github/workflows/build-artifact.yml` builds
-`apps/web/.next` on every push to `main` and publishes it as a Release asset.
-The repository is public, so the server downloads it with plain `curl` - no
-tokens or AWS credentials are required.
-
-**Required one-time setup.** In GitHub → *Settings → Secrets and variables →
-Actions → **Variables*** → *New repository variable*:
-
-| Variable | Example | Why it matters |
-| --- | --- | --- |
-| `NEXT_PUBLIC_API_URL` | `https://your-production-domain` | Next.js **inlines** `NEXT_PUBLIC_*` values into the bundle at build time. The workflow fails on purpose when this is unset, because the build would otherwise bake in the `http://localhost:3000` default and ship it to users. |
+1. [Architecture](#1-architecture)
+2. [Current production](#2-current-production)
+3. [Deploying a change](#3-deploying-a-change-the-common-case) ← **start here for day-to-day**
+4. [Provisioning a new server](#4-provisioning-a-new-server-from-scratch)
+5. [HTTPS and DNS](#5-https-and-dns)
+6. [Troubleshooting](#6-troubleshooting)
+7. [Known issues](#7-known-issues)
 
 ---
 
-## Initial Server Setup
+## 1. Architecture
 
-### 1. Connect to EC2 Instance
-```bash
-ssh -i "unified.pem" ubuntu@ec2-51-112-164-164.me-central-1.compute.amazonaws.com
+```
+push to main
+    |
+    v
+GitHub Actions (build-artifact.yml)      <- 16 GB runner, throwaway postgres
+    |  builds apps/web/.next
+    |  publishes Release  build-<short-sha>
+    v
+GitHub Release asset (~7 MB, public)
+    |
+    |  pnpm deploy:fetch-build           <- matches the checkout's exact commit
+    v
+EC2 (Amazon Linux 2023)
+    |
+    +-- nginx  :443 --> :3000   (TLS via Let's Encrypt)
+    +-- PM2
+          +-- portal-web      (next start)
+          +-- portal-worker   (PDF / workbook / ESG-driver / email jobs)
+    |
+    v
+AWS RDS PostgreSQL (eu-central-1)   <- esg + credit databases
 ```
 
-### 2. Update System Packages
+**Both PM2 processes are mandatory.** `portal-worker` runs all long jobs. Never
+deploy or reload only `portal-web`.
+
+### Why the artifact, not a server build
+
+| | |
+|---|---|
+| `portal-web` (PM2 cap) | up to 1 GB |
+| `portal-worker` (PM2 cap) | up to 2 GB |
+| `next build` | +2-4 GB |
+| **t3.medium total** | **4 GB** |
+
+It cannot fit. CI has 16 GB.
+
+---
+
+## 2. Current production
+
+| | |
+|---|---|
+| Instance | `3.73.118.249` (`eu-central-1`, Amazon Linux 2023, t3.medium) |
+| SSH | `ssh -i "new.pem" ec2-user@3.73.118.249` |
+| URL | https://unifiedportal.duckdns.org |
+| App root | `/var/www/current` -> symlink to `/var/www/portal-vN` |
+| Databases | RDS PostgreSQL, **`eu-central-1`** (same region as EC2 - keep it that way) |
+| Node / pnpm | 22.x / 10.18.1 |
+| Repo | https://github.com/saikrishna-pashapu2/Unified-portal (public) |
+
+> **Region matters.** EC2 and RDS must share a region. A previous setup ran EC2
+> in `me-central-1` against RDS in `eu-central-1` and paid ~100 ms cross-region
+> latency on every query.
+
+### One-time GitHub setup
+
+**Settings -> Secrets and variables -> Actions -> Variables:**
+
+| Variable | Value |
+| --- | --- |
+| `NEXT_PUBLIC_API_URL` | `https://unifiedportal.duckdns.org` |
+
+Next.js **inlines** `NEXT_PUBLIC_*` into the bundle **at build time**. The
+workflow fails on purpose if it is unset, because the build would otherwise bake
+`http://localhost:3000` into production. **If the domain ever changes, update
+this variable BEFORE merging**, or the artifact ships the wrong URL.
+
+---
+
+## 3. Deploying a change (the common case)
+
+### 3.1 Push and wait for the artifact
+
 ```bash
-sudo apt update && sudo apt upgrade -y
+git add -A
+git commit -m "your change"
+git push origin main
 ```
 
-### 2b. Add Swap (recommended safety net)
+Wait for **Build artifact** to go green:
+https://github.com/saikrishna-pashapu2/Unified-portal/actions/workflows/build-artifact.yml
 
-A t3.medium has only 4 GB RAM and runs both PM2 processes plus `pnpm install`.
-Swap prevents the OOM-killer from taking down the app during deploys.
+It publishes a Release tagged `build-<short-sha>`. **Do not deploy before it is
+green** - the server can only fetch an artifact that exists for its commit.
+
+### 3.2 Deploy on the server
+
+Versioned directory + symlink, so rollback is instant. Bump `portal-vN`.
 
 ```bash
-sudo fallocate -l 4G /swapfile
+ssh -i "new.pem" ec2-user@ec2-3-73-118-249.eu-central-1.compute.amazonaws.com
+
+cd /var/www
+git clone https://github.com/saikrishna-pashapu2/Unified-portal.git portal-v2
+cd portal-v2
+
+# Reuse the existing env (never regenerate it by hand)
+cp /var/www/current/.env .env
+chmod 600 .env
+cp .env apps/web/.env
+
+pnpm install
+pnpm db:generate
+pnpm deploy:fetch-build        # NEVER run `pnpm build` here
+```
+
+`pnpm install` may report that dependency build scripts were ignored. Do not
+run the interactive `pnpm approve-builds` command during a versioned production
+deploy. The required Prisma clients are generated explicitly by the next step;
+an ignored-build warning is not the `worker:check-db` ESM loader failure
+described under Troubleshooting.
+
+Confirm the fetch matched your commit and baked the right URL:
+
+```
+==> Artifact: build-<your-sha>
+web-next.tar.gz: OK
+"nextPublicApiUrl": "https://unifiedportal.duckdns.org"
+==> Done. apps/web/.next is ready
+```
+
+**Fix the Prisma engine** (required until [Known issues #1](#7-known-issues) is
+fixed - the artifact is built on Ubuntu, the server is RHEL-family):
+
+```bash
+cp packages/db-esg/generated/client/libquery_engine-rhel-openssl-3.0.x.so.node \
+   apps/web/.next/server/
+ls -la apps/web/.next/server/ | grep -i engine   # must exist
+```
+
+Apply migrations **only if there are new ones**:
+
+```bash
+set -a; source .env; set +a
+DATABASE_URL="$ESG_DATABASE_URL"    pnpm -C packages/db-esg    exec prisma migrate status
+DATABASE_URL="$CREDIT_DATABASE_URL" pnpm -C packages/db-credit exec prisma migrate status
+```
+
+- *"Database schema is up to date!"* -> skip migrations.
+- *"...have not yet been applied"* -> see [Known issues #2](#7-known-issues) first.
+- *"migration from the database is not found locally"* -> **stop the deploy**.
+  The checkout has lost part of production's migration history. Never use
+  `migrate reset` or `migrate resolve` to hide this in production. Restore the
+  exact original migration file, compare its SHA-256 with the corresponding
+  `_prisma_migrations.checksum`, and rerun `migrate status`. Proceed only when
+  no database-only migration remains.
+
+When the only remaining ESG migration is a new pending migration and the
+separate migration identity is configured, apply it through the guarded script:
+
+```bash
+NODE_ENV=production pnpm db:migrate:deploy esg
+DATABASE_URL="$ESG_DATABASE_URL" pnpm -C packages/db-esg exec prisma migrate status
+```
+
+Do not bypass the guarded script with the runtime database identity. If
+`ESG_MIGRATION_DATABASE_URL` is missing, migration deployment is blocked until
+the dedicated role is provisioned.
+
+Verify DB connectivity before cutting over:
+
+```bash
+pnpm -C apps/web worker:check-db      # expect: database and migration check passed
+```
+
+### 3.3 Cut over
+
+```bash
+mkdir -p /var/www/portal-v2/logs
+cp /var/www/current/ecosystem.config.js /var/www/portal-v2/ 2>/dev/null
+
+pm2 delete all
+cd /var/www
+sudo ln -sfn /var/www/portal-v2 /var/www/current
+cd /var/www/current
+pm2 start ecosystem.config.js
+pm2 save
+```
+
+### 3.4 Verify
+
+```bash
+pm2 status                                  # both online, restarts (↺) not climbing
+curl -I http://localhost:3000               # 307 -> /esg
+curl -I https://unifiedportal.duckdns.org   # 307 -> /esg
+pm2 logs --lines 40 --nostream              # no prisma:error
+```
+
+Then hard-refresh the browser (**Ctrl+Shift+R**). `Failed to find Server Action`
+errors right after a deploy are just cached JS from the old build.
+
+### 3.5 Rollback
+
+```bash
+pm2 delete all
+sudo ln -sfn /var/www/portal-v1 /var/www/current    # previous version
+cd /var/www/current && pm2 start ecosystem.config.js && pm2 save
+```
+
+Keep the previous directory for a few days, then `sudo rm -rf /var/www/portal-v1`.
+
+---
+
+## 4. Provisioning a new server from scratch
+
+Amazon Linux 2023, `ec2-user`, `dnf`. (**Not** Ubuntu/`apt`/`ubuntu` - an older
+version of this guide was Ubuntu and its commands do not apply.)
+
+### 4.1 Instance and security groups
+
+- **t3.medium**, Amazon Linux 2023, **same region as RDS (`eu-central-1`)**
+- Root volume: **30 GB** (8 GB fills up: 4 GB swap + ~2 GB node_modules)
+
+**EC2 inbound:** 22 (your IP only), 80, 443. **Not 3000** - nginx proxies it.
+
+**RDS inbound:** PostgreSQL 5432, source = **the EC2 security group** (not
+`0.0.0.0/0`, not "all traffic"). Do this for **both** databases.
+
+### 4.2 System
+
+```bash
+sudo dnf update -y
+
+# Swap - stops the OOM-killer taking the app down during installs
+sudo dd if=/dev/zero of=/swapfile bs=1M count=4096 status=progress
 sudo chmod 600 /swapfile
 sudo mkswap /swapfile
 sudo swapon /swapfile
 echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
-free -h   # confirm the swap line is non-zero
-```
+free -h
 
-### 3. Install Node.js 22
+# Node 22 (engines requires >=22.12.0; CI builds on 22.14.0 - majors must match)
+curl -fsSL https://rpm.nodesource.com/setup_22.x | sudo bash -
+sudo dnf install -y nodejs
+node --version
 
-> The repository requires Node **>= 22.12.0** (`engines` in `package.json`), and
-> CI builds the deployed artifact on Node 22.14.0. The server must run the same
-> major version. Node 20 is **not** supported.
+# pnpm (pinned by packageManager)
+sudo corepack enable
+corepack prepare pnpm@10.18.1 --activate
 
-```bash
-curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-sudo apt-get install -y nodejs
-```
-
-Verify installation:
-```bash
-node --version  # Should show v22.x.x
-```
-
-### 4. Install pnpm
-```bash
-curl -fsSL https://get.pnpm.io/install.sh | sh -
-source ~/.bashrc
-```
-
-Verify installation:
-```bash
-pnpm --version
-which pnpm  # Note this path, you'll need it later
-```
-
-### 5. Install PM2 and Other Tools
-```bash
+sudo dnf install -y git cronie
+sudo systemctl enable --now crond
 sudo npm install -g pm2
-sudo apt install git postgresql-client -y
 ```
 
----
+If the root volume was resized after launch:
 
-## Application Deployment
-
-### 6. Create Deployment Directory
 ```bash
-sudo mkdir -p /var/www
+lsblk                        # xvda 30G but xvda1 8G?
+sudo growpart /dev/xvda 1    # grow the PARTITION first (note the space)
+sudo xfs_growfs /            # then the FILESYSTEM
+df -h /
+```
+
+### 4.3 Application
+
+```bash
+sudo mkdir -p /var/www && sudo chown ec2-user:ec2-user /var/www
 cd /var/www
+git clone https://github.com/saikrishna-pashapu2/Unified-portal.git portal-v1
+cd portal-v1
+nano .env      # see 4.4
+chmod 600 .env
+cp .env apps/web/.env
+pnpm install
+pnpm db:generate
+pnpm deploy:fetch-build
+cp packages/db-esg/generated/client/libquery_engine-rhel-openssl-3.0.x.so.node apps/web/.next/server/
 ```
 
-### 7. Clone Repository (First Time)
-```bash
-sudo git clone https://github.com/saikrishna-pashapu2/Unified-portal.git portal-v1.0.0
-sudo chown -R ubuntu:ubuntu portal-v1.0.0
-cd portal-v1.0.0
-```
+### 4.4 `.env`
 
-### 8. Get EC2 Public IP
-```bash
-curl -s http://169.254.169.254/latest/meta-data/public-ipv4
-```
-**Note this IP address** - you'll use it in the next step.
+Copy from the running server (`cp /var/www/current/.env .env`) rather than
+retyping. For a genuinely new environment:
 
-### 9. Create Production Environment File
 ```bash
-cat > .env << 'EOF'
-# Database Configuration
-ESG_DATABASE_URL="postgresql://USER:PASSWORD@RDS_ENDPOINT:5432/esg_db?schema=public&sslmode=require"
-CREDIT_DATABASE_URL="postgresql://USER:PASSWORD@RDS_ENDPOINT:5432/credit_db?schema=public&sslmode=require"
-ESG_MIGRATION_DATABASE_URL="postgresql://MIGRATOR:PASSWORD@RDS_ENDPOINT:5432/esg_db?schema=public&sslmode=require"
-CREDIT_MIGRATION_DATABASE_URL="postgresql://MIGRATOR:PASSWORD@RDS_ENDPOINT:5432/credit_db?schema=public&sslmode=require"
+ESG_DATABASE_URL=postgresql://USER:PASSWORD@ESG_HOST:5432/postgres?sslmode=require
+CREDIT_DATABASE_URL=postgresql://USER:PASSWORD@CREDIT_HOST:5432/postgres?sslmode=require
+ESG_MIGRATION_DATABASE_URL=postgresql://MIGRATOR:PASSWORD@ESG_HOST:5432/postgres?sslmode=require
+CREDIT_MIGRATION_DATABASE_URL=postgresql://MIGRATOR:PASSWORD@CREDIT_HOST:5432/postgres?sslmode=require
 
-# Application Configuration
-NEXTAUTH_URL="https://YOUR_DOMAIN"
-NEXTAUTH_SECRET="your-nextauth-secret-key"
-APP_URL="http://YOUR_EC2_IP:3000"
-NODE_ENV="production"
+NEXTAUTH_URL=https://unifiedportal.duckdns.org
+APP_URL=https://unifiedportal.duckdns.org
+NEXT_PUBLIC_API_URL=https://unifiedportal.duckdns.org
+NEXTAUTH_SECRET=            # openssl rand -hex 32
+CRON_SECRET=                # openssl rand -hex 32
+
+NODE_ENV=production
 PORT=3000
+PDFX_STORAGE_DIR=.pdfx_store
 
-# Email Configuration (Gmail SMTP)
-MAIL_SERVER="smtp.gmail.com"
+MAIL_SERVER=smtp.gmail.com
 MAIL_PORT=587
-MAIL_USERNAME="your-email@gmail.com"
-MAIL_PASSWORD="your-app-specific-password"
-MAIL_FROM="your-email@gmail.com"
+MAIL_USERNAME=
+MAIL_PASSWORD="app password with spaces MUST be quoted"
+MAIL_FROM=
 
-# Alert System
-CRON_SECRET="your-cron-secret-key"
+OPENAI_API_KEY=
+OPENAI_ESG_DRIVERS_MODEL=gpt-5.4-mini
+GOOGLE_API_KEY_2=
+GOOGLE_CSE_ID_2=
+TAVILY_API_KEY=
 
-# AI and research APIs (required by ESG Drivers)
-OPENAI_API_KEY="your-openai-api-key"
-OPENAI_ESG_DRIVERS_MODEL="gpt-5.4-mini"
-GOOGLE_API_KEY_2="your-google-custom-search-key"
-GOOGLE_CSE_ID_2="your-google-custom-search-engine-id"
-
-# Bounded worker pools
 WORKER_CONCURRENCY=2
 WORKER_EMAIL_POLL_MS=5000
 WORKBOOK_WORKER_CONCURRENCY=2
-EOF
 ```
 
-**Important**: Replace all placeholder values with your actual credentials:
-- `USER:PASSWORD@RDS_ENDPOINT` - Your RDS connection details
-- `YOUR_EC2_IP` - Your EC2 public IP from step 8
-- `your-nextauth-secret-key` - Generate with: `openssl rand -base64 32`
-- `your-email@gmail.com` - Your Gmail address
-- `your-app-specific-password` - Gmail App Password (not regular password)
-- `your-cron-secret-key` - Generate with: `openssl rand -base64 32`
-- `your-openai-api-key` - Your OpenAI API key
-- Google Custom Search API key and engine ID are required for ESG Drivers
-- Migration URLs must use deployment identities distinct from the two runtime identities
+**`.env` syntax rules** - `set -a; source .env` is real shell, so:
+- **no space after `=`** (`KEY= value` makes the value *empty*)
+- **quote any value containing spaces** (`MAIL_PASSWORD="a b c d"`)
 
-Set proper permissions:
-```bash
-chmod 600 .env
-```
-
-### 10. Copy Environment File for Next.js Build
-```bash
-cp .env apps/web/.env
-```
-
-### 11. Install Dependencies
-```bash
-pnpm install
-```
-This will take 3-5 minutes.
-
-### 12. Generate Prisma Clients
-```bash
-pnpm db:generate
-```
-
-### 13. Fetch the Prebuilt Application
-
-> **Do not run `pnpm build` on this server.** A t3.medium has 4 GB RAM, and the
-> deploy runs while PM2 still serves the previous version (`portal-web` up to
-> 1 GB + `portal-worker` up to 2 GB). `next build` needs another 2-4 GB on top,
-> so it gets OOM-killed. GitHub Actions builds `.next` for every commit on
-> `main` and publishes it as a Release asset; the server just downloads it.
+Both mistakes fail as `-bash: <word>: command not found`. If you see that, the
+variable did not load. Sanity check:
 
 ```bash
-pnpm deploy:fetch-build
-set -a
-source .env
-set +a
-export NODE_ENV=production
-pnpm prod:check
-pnpm db:migrate:deploy
-pnpm -C apps/web worker:check-db
+set -a; source .env; set +a     # must print nothing
 ```
 
-`deploy:fetch-build` downloads the artifact matching **this checkout's commit**
-(`build-<short-sha>`), verifies its SHA-256, and extracts it to
-`apps/web/.next`. If it reports that no artifact exists, the
-[Build artifact workflow](https://github.com/saikrishna-pashapu2/Unified-portal/actions/workflows/build-artifact.yml)
-has not finished for that commit yet - wait for it rather than building locally.
+> `ESG_DATABASE_URL` / `CREDIT_DATABASE_URL` are the names the app reads.
+> `DATABASE_URL_ESG` / `DATABASE_URL_CREDIT` are **not** recognized.
 
-The fetch should complete with output like:
-```
-==> Commit:   a1b2c3d4...
-==> Artifact: build-a1b2c3d4e5f6
-==> Verifying checksum
-web-next.tar.gz: OK
-==> Extracting to apps/web/.next
-==> Done. apps/web/.next is ready (BUILD_ID: IApaods-hSSCQY2jFL5EK)
-```
+### 4.5 PM2
 
----
-
-## PM2 Configuration
-
-### 14. Create Logs Directory
 ```bash
-cd /var/www/portal-v1.0.0
+cd /var/www/portal-v1
 mkdir -p logs
-```
+sudo ln -sfn /var/www/portal-v1 /var/www/current
 
-### 15. Create PM2 Ecosystem Config
-```bash
-cat > ecosystem.config.js << 'EOF'
+cat > /var/www/current/ecosystem.config.js << 'EOF'
 module.exports = {
   apps: [
-    {
-      name: 'portal-web',
-      cwd: '/var/www/current',
-      script: 'pnpm',
-      args: '-C apps/web start',
-      interpreter: 'none',
-      instances: 1,
-      exec_mode: 'fork',
-      env: { NODE_ENV: 'production', PORT: 3000 },
-      error_file: '/var/www/current/logs/web-error.log',
-      out_file: '/var/www/current/logs/web-output.log',
-      autorestart: true,
-      max_memory_restart: '1G',
-      watch: false
-    },
-    {
-      name: 'portal-worker',
-      cwd: '/var/www/current',
-      script: 'pnpm',
-      args: '-C apps/web worker',
-      interpreter: 'none',
-      instances: 1,
-      exec_mode: 'fork',
-      env: { NODE_ENV: 'production' },
-      error_file: '/var/www/current/logs/worker-error.log',
-      out_file: '/var/www/current/logs/worker-output.log',
-      autorestart: true,
-      max_memory_restart: '2G',
-      watch: false
-    }
+    { name: 'portal-web', cwd: '/var/www/current', script: 'pnpm', args: '-C apps/web start',
+      interpreter: 'none', env: { NODE_ENV: 'production', PORT: 3000 },
+      max_memory_restart: '1G', autorestart: true },
+    { name: 'portal-worker', cwd: '/var/www/current', script: 'pnpm', args: '-C apps/web worker',
+      interpreter: 'none', env: { NODE_ENV: 'production' },
+      max_memory_restart: '2G', autorestart: true }
   ]
 }
 EOF
-```
 
-### 16. Create Symlink
-```bash
-cd /var/www
-sudo ln -sf /var/www/portal-v1.0.0 /var/www/current
-```
-
-### 17. Start Application with PM2
-```bash
 cd /var/www/current
 pm2 start ecosystem.config.js
-```
-
-### 18. Save PM2 Configuration
-```bash
 pm2 save
+pm2 startup            # then RUN the `sudo env PATH=...` line it prints
+pm2 save
+curl -I http://localhost:3000      # 307 -> /esg
 ```
 
-### 19. Setup PM2 Auto-Start on Reboot
-```bash
-pm2 startup
-```
-
-Copy the command that PM2 outputs (starts with `sudo env PATH=...`) and run it.
+`pm2 startup` only *prints* a command - you must run it, or nothing survives a
+reboot.
 
 ---
 
-## Verification
+## 5. HTTPS and DNS
 
-### 20. Check PM2 Status
+Order matters: **nginx -> DNS -> certbot**. Certbot needs DNS already pointing
+at this box to issue the certificate.
+
+### 5.1 nginx
+
 ```bash
-pm2 status
+sudo dnf install -y nginx
+
+sudo tee /etc/nginx/conf.d/portal.conf > /dev/null << 'EOF'
+server {
+    listen 80;
+    server_name unifiedportal.duckdns.org;
+
+    # PDF / workbook uploads; nginx defaults to 1M and would 413.
+    client_max_body_size 50M;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_cache_bypass $http_upgrade;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}
+EOF
+
+sudo nginx -t
+sudo systemctl enable --now nginx
+curl -I http://127.0.0.1 -H "Host: unifiedportal.duckdns.org"   # 307 -> /esg
 ```
 
-Should show:
-```
-┌────┬──────────────────┬─────────┬─────────┬────────┬─────────┐
-│ id │ name             │ mode    │ status  │ uptime │ memory  │
-├────┼──────────────────┼─────────┼─────────┼────────┼─────────┤
-│ 0  │ portal-web       │ fork    │ online  │ Xs     │ XXmb    │
-│ 1  │ portal-worker    │ fork    │ online  │ Xs     │ XXmb    │
-└────┴──────────────────┴─────────┴─────────┴────────┴─────────┘
-```
+### 5.2 DuckDNS
 
-### 21. Test Local Connection
+The token lives in `~/duckdns/duck.sh` on any box already running the updater.
+
+> **Stop the old server's updater first.** Its `*/5` cron re-points the domain
+> back within 5 minutes and certbot then fails confusingly. On the old box:
+> `crontab -e` and comment out the duckdns line (**not** `crontab -r`, which
+> deletes every job).
+
 ```bash
-curl -I http://localhost:3000
+mkdir -p ~/duckdns
+nano ~/duckdns/duck.sh
 ```
 
-Should return:
-```
-HTTP/1.1 307 Temporary Redirect
-Location: /esg
-...
-```
+One line - leave `ip=` **empty** so DuckDNS uses the calling machine's IP:
 
-### 22. View Application Logs
 ```bash
-pm2 logs portal-v1.0.0 --lines 50
+echo url="https://www.duckdns.org/update?domains=unifiedportal&token=YOUR_TOKEN&ip=" | curl -k -o ~/duckdns/duck.log -K -
 ```
 
-### 23. Test From Browser
-Open in your browser:
-```
-http://YOUR_EC2_IP:3000
+```bash
+chmod 700 ~/duckdns/duck.sh
+~/duckdns/duck.sh
+cat ~/duckdns/duck.log      # OK = success, KO = bad token/domain
+
+(crontab -l 2>/dev/null; echo "*/5 * * * * ~/duckdns/duck.sh >/dev/null 2>&1") | crontab -
+dig +short unifiedportal.duckdns.org     # must be this server's IP, and STAY there
 ```
 
-You should see your application's homepage redirecting to `/esg`.
+### 5.3 certbot
 
-### 24. Test Key Features
-- Homepage: `http://YOUR_EC2_IP:3000`
-- ESG Articles: `http://YOUR_EC2_IP:3000/esg/articles`
-- Credit Articles: `http://YOUR_EC2_IP:3000/credit/articles`
-- Sign In: `http://YOUR_EC2_IP:3000/signin`
-- Admin Panel: `http://YOUR_EC2_IP:3000/admin` (after login)
+Only once `dig` reliably returns this server's IP:
+
+```bash
+sudo dnf install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d unifiedportal.duckdns.org      # choose redirect HTTP->HTTPS
+
+# Amazon Linux does NOT start this by default, despite certbot's message.
+# Skip it and the cert silently expires in 90 days.
+sudo systemctl enable --now certbot-renew.timer
+sudo systemctl status certbot-renew.timer      # active (waiting)
+sudo certbot renew --dry-run                   # simulated renewals succeeded
+
+curl -I https://unifiedportal.duckdns.org      # 307 -> /esg
+```
 
 ---
 
-## Deploying New Versions
+## 6. Troubleshooting
 
-### Strategy
-We use versioned deployments with symlinks for zero-downtime updates.
+### `pnpm build` is killed / exit 137 on the server
+Expected - don't build here. Use `pnpm deploy:fetch-build`.
 
-### Step-by-Step Process
+### `deploy:fetch-build`: no artifact for this commit
+The workflow hasn't finished (or failed) for your commit. Check Actions. Never
+"fix" this by building locally.
 
-#### 1. On Local Machine - Push Changes to Git
+### `Prisma Client could not locate the Query Engine for runtime "rhel-openssl-3.0.x"`
+The engine copy step was skipped. See [Known issues #1](#7-known-issues).
+Symptom in the browser: *"An error occurred in the Server Components render."*
+Real error is always in `pm2 logs portal-web`.
+
+### `The "id" argument must be of type string. Received type number`
+A worker thread got a webpack module id instead of a path. See
+[Known issues #3](#7-known-issues).
+
+### Site loads but shows a server error
 ```bash
-# Commit your changes
-git add .
-git commit -m "Design rework"
-git push origin main
+pm2 logs portal-web --lines 80 --nostream
 ```
+Next hides details in production; PM2 logs have the real stack.
 
-#### 2. On EC2 - Clone New Version
+### DB connection hangs / times out
+RDS security group must allow 5432 from the EC2 security group. Test:
 ```bash
-cd /var/www
-sudo git clone https://github.com/saikrishna-pashapu2/Unified-portal.git portal-v1.0.6
-sudo chown -R ubuntu:ubuntu portal-v1.0.6
-cd portal-v1.0.6
-```
-
-#### 3. Copy Environment File
-```bash
-cp /var/www/portal-v1.0.5/.env .env
-cp .env apps/web/.env
-```
-
-#### 4. Install Dependencies
-```bash
-pnpm install
-```
-
-#### 5. Generate Prisma Clients
-```bash
-pnpm db:generate
-```
-
-#### 6. Fetch the Prebuilt Application
-
-> Never run `pnpm build` here - see step 13. Make sure the
-> [Build artifact workflow](https://github.com/saikrishna-pashapu2/Unified-portal/actions/workflows/build-artifact.yml)
-> has finished for the commit you just cloned.
-
-```bash
-pnpm deploy:fetch-build
-set -a
-source .env
-set +a
-export NODE_ENV=production
-pnpm prod:check
-pnpm db:migrate:deploy
 pnpm -C apps/web worker:check-db
 ```
 
-#### 7. Create Logs Directory
+### `ERR_PACKAGE_PATH_NOT_EXPORTED` for `unicorn-magic`
+This happens before any database connection. An older PDF worker loaded the
+ESM-only `execa` dependency through `tsx`'s CommonJS registration path. Do not
+edit `node_modules` or change RDS settings. Deploy a commit containing the
+PDF extractor's dynamic `import('execa')` fix, reinstall from the lockfile, and
+rerun `worker:check-db` before switching the production symlink.
+
+### `Failed to find Server Action "..."`
+Cached JS from the previous build. Hard-refresh (Ctrl+Shift+R). Harmless.
+
+### Disk full
 ```bash
-mkdir -p logs
+df -h /
+sudo growpart /dev/xvda 1 && sudo xfs_growfs /
+sudo rm -rf /var/www/portal-vOLD        # old releases
+pm2 flush                                # old logs
 ```
 
-#### 8. Update Ecosystem Config
-```bash
-cat > ecosystem.config.js << 'EOF'
-module.exports = {
-  apps: [
-    {
-      name: 'portal-web',
-      cwd: '/var/www/current',
-      script: 'pnpm',
-      args: '-C apps/web start',
-      interpreter: 'none',
-      instances: 1,
-      exec_mode: 'fork',
-      env: { NODE_ENV: 'production', PORT: 3000 },
-      error_file: '/var/www/current/logs/web-error.log',
-      out_file: '/var/www/current/logs/web-output.log',
-      autorestart: true,
-      max_memory_restart: '1G',
-      watch: false
-    },
-    {
-      name: 'portal-worker',
-      cwd: '/var/www/current',
-      script: 'pnpm',
-      args: '-C apps/web worker',
-      interpreter: 'none',
-      instances: 1,
-      exec_mode: 'fork',
-      env: { NODE_ENV: 'production' },
-      error_file: '/var/www/current/logs/worker-error.log',
-      out_file: '/var/www/current/logs/worker-output.log',
-      autorestart: true,
-      max_memory_restart: '2G',
-      watch: false
-    }
-  ]
-}
-EOF
-```
-
-Both processes are mandatory. Do not deploy or reload only `portal-web`.
-
-#### 9. Stop Old Version
-```bash
-pm2 delete all
-```
-
-#### 10. Update Symlink
-```bash
-cd /var/www
-sudo ln -sfn /var/www/portal-v1.0.6 /var/www/current
-```
-
-#### 11. Start New Version
-```bash
-cd /var/www/current
-pm2 start ecosystem.config.js
-pm2 save
-```
-
-#### 12. Verify New Version
-```bash
-pm2 status
-curl -I http://localhost:3000
-```
-
-#### 13. Test in Browser
-Visit `http://YOUR_EC2_IP:3000` and verify everything works.
-
-#### 14. (Optional) Clean Up Old Version
-After confirming the new version works for a few days:
-```bash
-sudo rm -rf /var/www/portal-v1.0.5
-```
+### Reboot lost everything
+`pm2 startup` printed a command that was never run. Re-run it, then `pm2 save`.
 
 ---
 
-## Useful PM2 Commands
+## 7. Known issues
 
-### Check Status
-```bash
-pm2 status
-```
+1. **Prisma engine must be copied by hand after every fetch.**
+   `binaryTargets` in both `packages/db-*/prisma/schema.prisma` is
+   `["native", "debian-openssl-3.0.x"]`. CI runs Ubuntu, so `native` = debian
+   and **no RHEL engine is ever built**; Amazon Linux needs
+   `rhel-openssl-3.0.x`. `next.config.js` sets
+   `transpilePackages: ['@esgcredit/db-esg', ...]`, so the Prisma client is
+   bundled into `.next` and ignores the server's own `pnpm db:generate`.
+   **Fix:** add `"rhel-openssl-3.0.x"` to `binaryTargets` in both schemas, then
+   drop the copy step.
 
-### View Logs (Live)
-```bash
-pm2 logs portal-v1.0.6
-```
+2. **Migration identities must be provisioned.** `db:migrate:deploy` requires
+   `ESG_MIGRATION_DATABASE_URL` / `CREDIT_MIGRATION_DATABASE_URL` (a *separate*
+   role from the runtime one) when `NODE_ENV=production`. A deployment with a
+   pending migration must stop if the corresponding value is absent. Never
+   work around the guard by assigning the runtime URL to the migration variable;
+   provision an app role and a separate migrator role instead.
 
-### View Last 50 Lines
-```bash
-pm2 logs portal-v1.0.5 --lines 50 --nostream
-```
+3. **Excel export is broken** (`The "id" argument must be of type string`).
+   `lib/workbook.ts` passes `require.resolve("xlsx")` into a worker thread;
+   webpack rewrites it to a numeric module id and the worker does
+   `require(78365)`. **Fix:** add `'xlsx'` to `serverExternalPackages` in
+   `next.config.js`.
 
-### Restart Application
-```bash
-pm2 restart portal-v1.0.4
-```
+4. **`pnpm prod:check` is stale** - it demands `DATABASE_URL_ESG` /
+   `DATABASE_URL_CREDIT`, which the app does not use (it reads
+   `ESG_DATABASE_URL` / `CREDIT_DATABASE_URL`). It fails even on a correct
+   `.env`. Don't add those aliases to work around it; fix the script.
 
-### Stop Application
-```bash
-pm2 stop portal-v1.0.0
-```
+5. **`output: 'standalone'` + `next start` is unsupported.** Next logs
+   `"next start" does not work with "output: standalone"`. It works today, but
+   the option only benefits Docker and adds ~168 MB of unused build output.
+   Since PM2 runs `next start`, remove it from `next.config.js`.
 
-### Delete Application
-```bash
-pm2 delete portal-v1.0.0
-```
-
-### Monitor Resources
-```bash
-pm2 monit
-```
-
-### List All Processes
-```bash
-pm2 list
-```
-
----
-
-## Troubleshooting
-
-### Application Won't Start
-
-**Check PM2 Status:**
-```bash
-pm2 status
-```
-
-**View Error Logs:**
-```bash
-pm2 logs portal-v1.0.0 --err --lines 100
-```
-
-**Check if Port 3000 is in Use:**
-```bash
-sudo lsof -i :3000
-```
-
-**Try Running Manually:**
-```bash
-cd /var/www/current/apps/web
-pnpm start
-```
-Press Ctrl+C to stop, then restart with PM2.
-
-### Can't Access from Browser
-
-**1. Check EC2 Security Group:**
-- Go to EC2 Console → Security Groups
-- Verify inbound rule allows port 3000 from 0.0.0.0/0
-
-**2. Check Application is Running:**
-```bash
-pm2 status
-curl http://localhost:3000
-```
-
-**3. Check AWS Public IP:**
-```bash
-curl -s http://169.254.169.254/latest/meta-data/public-ipv4
-```
-
-### Database Connection Errors
-
-**Check Environment Variables:**
-```bash
-cd /var/www/current
-cat .env | grep DATABASE_URL
-```
-
-**Test Database Connection:**
-```bash
-psql "postgresql://USER:PASSWORD@RDS_ENDPOINT:5432/esg_db?sslmode=require"
-```
-
-**Check RDS Security Group:**
-- Verify RDS security group allows connections from EC2 security group
-
-### Email Not Sending
-
-**Check Email Configuration:**
-```bash
-cd /var/www/current
-cat .env | grep MAIL_
-```
-
-**Verify Gmail App Password:**
-- Must use App Password, not regular Gmail password
-- Generate at: https://myaccount.google.com/apppasswords
-
-### High Memory Usage
-
-**Check Memory Usage:**
-```bash
-pm2 monit
-free -h
-```
-
-**Restart Application:**
-```bash
-pm2 restart portal-v1.0.5
-```
-
-**Increase Max Memory (if needed):**
-Edit `ecosystem.config.js` and change:
-```javascript
-max_memory_restart: '2G'  // Increase from 1G to 2G
-```
-
-Then reload:
-```bash
-pm2 reload ecosystem.config.js
-```
-
-### PM2 Not Starting on Reboot
-
-**Re-run Startup Command:**
-```bash
-pm2 startup
-# Copy and run the command it outputs
-pm2 save
-```
-
-**Check Systemd Service:**
-```bash
-systemctl status pm2-ubuntu
-```
-
-### Application Logs Empty
-
-If PM2 logs are empty but app is errored, check:
-
-**1. File Permissions:**
-```bash
-ls -la /var/www/current/logs/
-```
-
-**2. PM2 Default Logs:**
-```bash
-ls -la ~/.pm2/logs/
-cat ~/.pm2/logs/portal-v1.0.0-error.log
-```
-
-**3. Try Running Manually:**
-```bash
-cd /var/www/current/apps/web
-node node_modules/next/dist/bin/next start -p 3000
-```
+6. **`ci.yml` has never run.** It is a good gate (postgres service, migrations,
+   type-check, lint, tests, e2e) but is untracked, so nothing blocks a bad
+   commit from reaching `main`. It also sets `OPENAI_API_KEY` only for
+   `prod:check`, not for the build - so its build step would fail the same way
+   `build-artifact.yml` did until placeholders were added.
 
 ---
 
-## File Structure on EC2
+## Appendix: why the build needs a database and fake API keys
 
-```
-/var/www/
-├── portal-v1.0.0/           # First deployment
-│   ├── .env                 # Environment variables
-│   ├── ecosystem.config.js  # PM2 configuration
-│   ├── logs/                # Application logs
-│   │   ├── error.log
-│   │   └── output.log
-│   ├── apps/
-│   │   └── web/
-│   │       ├── .env         # Copy of root .env
-│   │       ├── .next/       # Built application
-│   │       └── node_modules/
-│   ├── packages/
-│   └── [other repository files]
-│
-├── portal-v1.0.1/           # New version deployment
-│   └── [same structure]
-│
-└── current -> portal-v1.0.1 # Symlink to active version
-```
+`next build` does more than compile:
 
----
+- Both Prisma clients **throw at import time** if their URL is unset, and Next
+  imports every API route while collecting page data.
+- Five modules run `new OpenAI(...)` at **module scope** (`pdfx/translate`,
+  `tenders/classifier`, `tenders/processor`, `tenders/translator`,
+  `tenders/translator-simple`), so those keys must be *present*.
+- `/credit/publications` executes `prisma.$queryRaw()` during prerender, so a
+  reachable, migrated database is genuinely required.
 
-## Security Best Practices
+That is why `build-artifact.yml` starts a throwaway `postgres:17` and passes
+placeholder keys, and why the old runbook copied `.env` before building.
 
-1. **Environment Files**: Never commit `.env` files to Git
-2. **File Permissions**: Keep `.env` files with `chmod 600`
-3. **SSH Keys**: Use SSH key authentication, disable password auth
-4. **Security Groups**: Restrict SSH (port 22) to your IP only
-5. **Regular Updates**: Keep Ubuntu and Node.js updated
-6. **Monitoring**: Set up monitoring (Sentry, LogRocket, etc.)
-7. **Backups**: Regular RDS automated backups
-8. **Secrets Rotation**: Regularly rotate API keys and passwords
-
----
-
-## Performance Optimization
-
-### Enable PM2 Cluster Mode (Optional)
-For better performance on multi-core instances, update `ecosystem.config.js`:
-
-```javascript
-instances: 2,           // Number of instances
-exec_mode: 'cluster',   // Cluster mode
-```
-
-Then restart:
-```bash
-pm2 reload ecosystem.config.js
-```
-
-### Database Optimization
-Apply indexes from `DATABASE_ARCHITECTURE.md` if you have many records.
-
----
-
-## Monitoring & Maintenance
-
-### Daily Checks
-```bash
-pm2 status
-pm2 logs portal-v1.0.5
-```
-
-### Weekly Maintenance
-```bash
-# Check disk space
-df -h
-
-# Check memory usage
-free -h
-
-# Update system packages
-sudo apt update && sudo apt upgrade -y
-
-# Check PM2 logs size
-du -sh /var/www/current/logs/*
-```
-
-### Monthly Tasks
-- Review and rotate logs
-- Check RDS performance metrics
-- Review AWS billing
-- Update Node.js if new LTS version available
-
----
-
-## Contact & Support
-
-- **Repository**: https://github.com/saikrishna-pashapu2/Unified-portal
-- **EC2 Instance**: Ubuntu 22.04 LTS
-- **Application URL**: http://YOUR_EC2_IP:3000
-
----
-
-## Quick Reference Commands
-
-```bash
-# Check application status
-pm2 status
-
-# View logs
-pm2 logs portal-v1.0.0
-
-# Restart application
-pm2 restart portal-v1.0.0
-
-# Update code (simple update - same version)
-# NOTE: fetch the prebuilt .next; never run `pnpm build` on the server.
-cd /var/www/current && git pull origin main && pnpm install && pnpm db:generate && pnpm deploy:fetch-build && pm2 restart all
-
-# Check what's listening on port 3000
-sudo lsof -i :3000
-
-# Test local connection
-curl http://localhost:3000
-
-# Get EC2 public IP
-curl -s http://169.254.169.254/latest/meta-data/public-ipv4
-```
-
----
-
-**Deployment Completed**: October 15, 2025
-**Document Version**: 1.0.0
-
-              
+**Placeholders cannot leak into the artifact.** Next inlines only
+`NEXT_PUBLIC_*`; every other value stays a runtime `process.env` lookup that the
+server resolves from its own `.env` at start.
