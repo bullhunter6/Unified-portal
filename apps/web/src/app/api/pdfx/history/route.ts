@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { esgPrisma } from '@esgcredit/db-esg';
 import { ensureUserId } from '@/lib/session-user';
-import { parsePagination } from '@/lib/pagination';
+import { parsePdfxPagination } from '@/lib/pdfx/pagination';
 
 export const dynamic = 'force-dynamic';
 
@@ -14,11 +14,7 @@ export async function GET(request: Request) {
 
     // Optional: pagination
     const url = new URL(request.url);
-    const pagination = parsePagination(url.searchParams, {
-      sizeKey: 'size',
-      defaultSize: 20,
-      maxSize: 100,
-    });
+    const pagination = parsePdfxPagination(url.searchParams);
     if (!pagination) {
       return NextResponse.json({ error: 'Invalid pagination' }, { status: 400 });
     }
