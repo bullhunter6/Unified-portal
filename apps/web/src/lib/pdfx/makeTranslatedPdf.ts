@@ -1,142 +1,201 @@
-import { PDFDocument, rgb } from 'pdf-lib';
+import { PDFDocument, rgb, type PDFFont, type PDFPage } from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
+import bidiFactory from 'bidi-js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import type { SourcePageMapping, TranslatedPdfResult } from './types';
 
 type PageBlock = { pageNumber: number; text: string };
 
-const A4 = { w: 595.28, h: 841.89 }; // 72 dpi points
+const A4 = { w: 595.28, h: 841.89 };
 const MARGIN = 48;
+const ARABIC_CHARACTER = /[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff\ufb50-\ufdff\ufe70-\ufeff]/g;
+const bidi = bidiFactory();
 
-function normalizeText(input: string) {
-  // Normalize Unicode & line endings; strip lone control chars that can break writers
+export function normalizePdfText(input: string): string {
   return (input ?? '')
-    .replace(/\r\n/g, '\n')
-    .replace(/\u2028|\u2029/g, '\n')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, ' ')
+    .replace(/[\u2028\u2029]/g, '\n')
+    .replace(/[\ufdd0-\ufdef\ufffe\uffff]/g, '')
     .replace(/[^\S\n]+$/gm, '')
     .normalize('NFC');
 }
 
-function wrapLines(text: string, maxWidth: number, font: any, fontSize: number) {
-  const out: string[] = [];
-  const paragraphs = text.split(/\n{2,}/g);
-  for (const p of paragraphs) {
-    const words = p.split(/\s+/g);
-    let line = '';
-    for (const w of words) {
-      const test = line ? line + ' ' + w : w;
-      const wpx = font.widthOfTextAtSize(test, fontSize);
-      if (wpx > maxWidth) {
-        if (line) out.push(line);
-        // if single word is wider than maxWidth -> hard-split by glyph advance
-        if (font.widthOfTextAtSize(w, fontSize) > maxWidth) {
-          let chunk = '';
-          for (const ch of w) {
-            const t = chunk + ch;
-            if (font.widthOfTextAtSize(t, fontSize) > maxWidth) {
-              if (chunk) out.push(chunk);
-              chunk = ch;
-            } else {
-              chunk = t;
-            }
-          }
-          if (chunk) out.push(chunk);
-          line = '';
-        } else {
-          line = w;
-        }
+function isRtlLine(text: string): boolean {
+  ARABIC_CHARACTER.lastIndex = 0;
+  return ARABIC_CHARACTER.test(text);
+}
+
+/**
+ * Fontkit shapes an Arabic line as one RTL run and reverses every glyph in it,
+ * including embedded LTR runs such as Western digits. Preorder the logical text
+ * with the Unicode bidi algorithm so Fontkit's final reversal yields the proper
+ * visual order without turning `10` into `01`.
+ */
+export function prepareRtlLineForPdf(text: string): string {
+  const embedding = bidi.getEmbeddingLevels(text, 'rtl');
+  const characters = text.split('');
+
+  bidi.getMirroredCharactersMap(text, embedding).forEach((replacement, index) => {
+    characters[index] = replacement;
+  });
+  for (const [start, end] of bidi.getReorderSegments(text, embedding)) {
+    for (let left = start, right = end; left < right; left += 1, right -= 1) {
+      const character = characters[left];
+      characters[left] = characters[right];
+      characters[right] = character;
+    }
+  }
+
+  return Array.from(characters.join('')).reverse().join('');
+}
+
+function wrapLogicalLine(
+  logicalLine: string,
+  maxWidth: number,
+  font: PDFFont,
+  fontSize: number,
+): string[] {
+  if (!logicalLine.trim()) return [''];
+  const output: string[] = [];
+  const words = logicalLine.trim().split(/\s+/g);
+  let line = '';
+
+  for (const word of words) {
+    const candidate = line ? `${line} ${word}` : word;
+    if (font.widthOfTextAtSize(candidate, fontSize) <= maxWidth) {
+      line = candidate;
+      continue;
+    }
+    if (line) output.push(line);
+    if (font.widthOfTextAtSize(word, fontSize) <= maxWidth) {
+      line = word;
+      continue;
+    }
+
+    let fragment = '';
+    for (const character of Array.from(word)) {
+      const candidateFragment = fragment + character;
+      if (
+        fragment &&
+        font.widthOfTextAtSize(candidateFragment, fontSize) > maxWidth
+      ) {
+        output.push(fragment);
+        fragment = character;
       } else {
-        line = test;
+        fragment = candidateFragment;
       }
     }
-    if (line) out.push(line);
-    out.push(''); // blank line between paragraphs
+    line = fragment;
   }
-  while (out.length && out[out.length - 1] === '') out.pop();
-  return out;
+  if (line) output.push(line);
+  return output;
+}
+
+export function wrapLines(
+  text: string,
+  maxWidth: number,
+  font: PDFFont,
+  fontSize: number,
+): string[] {
+  return normalizePdfText(text)
+    .split('\n')
+    .flatMap((line) => wrapLogicalLine(line, maxWidth, font, fontSize));
+}
+
+function drawHeader(
+  page: PDFPage,
+  sourcePageNumber: number,
+  continuation: boolean,
+  font: PDFFont,
+): number {
+  const label = continuation
+    ? `Source page ${sourcePageNumber} (continued)`
+    : `Source page ${sourcePageNumber}`;
+  page.drawText(label, {
+    x: MARGIN,
+    y: A4.h - MARGIN,
+    size: 10,
+    font,
+    color: rgb(0.2, 0.2, 0.2),
+  });
+  return A4.h - MARGIN - 18;
+}
+
+async function resolveFontPath(): Promise<string> {
+  const moduleDirectory = path.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    path.resolve(process.cwd(), 'public', 'fonts', 'DejaVuSans.ttf'),
+    path.resolve(process.cwd(), 'apps', 'web', 'public', 'fonts', 'DejaVuSans.ttf'),
+    path.resolve(moduleDirectory, '../../../public/fonts/DejaVuSans.ttf'),
+  ];
+  for (const candidate of candidates) {
+    try {
+      await fs.access(candidate);
+      return candidate;
+    } catch {
+      // Continue to the next known application layout.
+    }
+  }
+  throw new Error('PDF translation font DejaVuSans.ttf is missing');
 }
 
 export async function makeTranslatedPdf(
   pages: PageBlock[],
   outPath: string,
-  title = 'Translated Document'
-) {
-  // ensure output dir exists
+  title = 'Translated Document',
+): Promise<TranslatedPdfResult> {
   await fs.mkdir(path.dirname(outPath), { recursive: true });
-
-  // ✅ resolve font without duplicating apps/web
-  let fontPath = path.resolve(process.cwd(), 'public', 'fonts', 'DejaVuSans.ttf');
-  try {
-    await fs.access(fontPath);
-  } catch {
-    // try other candidates
-    const alt1 = path.resolve(process.cwd(), 'apps', 'web', 'public', 'fonts', 'DejaVuSans.ttf');
-    const alt2 = path.resolve(__dirname, '../../../../public/fonts/DejaVuSans.ttf');
-    try {
-      await fs.access(alt1);
-      fontPath = alt1;
-    } catch {
-      await fs.access(alt2);
-      fontPath = alt2;
-    }
-  }
-
-  const fontBytes = await fs.readFile(fontPath);
-
+  const fontBytes = await fs.readFile(await resolveFontPath());
   const pdf = await PDFDocument.create();
-  
-  // Register fontkit for custom font support
   pdf.registerFontkit(fontkit);
-  
   pdf.setTitle(title);
+  pdf.setSubject('Text translation with explicit source-page mapping');
 
   const font = await pdf.embedFont(fontBytes, { subset: true });
-  const fontBold = font; // or embed a bold TTF if you add one
   const fontSize = 11;
   const lineGap = 4;
   const usableWidth = A4.w - MARGIN * 2;
+  const pageMap: SourcePageMapping[] = [];
 
-  for (const p of pages.sort((a, b) => a.pageNumber - b.pageNumber)) {
-    let page = pdf.addPage([A4.w, A4.h]);
-    let y = A4.h - MARGIN;
+  for (const source of [...pages].sort((a, b) => a.pageNumber - b.pageNumber)) {
+    const mapping: SourcePageMapping = {
+      sourcePageNumber: source.pageNumber,
+      outputPageNumbers: [],
+    };
+    pageMap.push(mapping);
 
-    // header
-    const header = `Page ${p.pageNumber}`;
-    page.drawText(header, {
-      x: MARGIN,
-      y,
-      size: 10,
-      font: fontBold,
-      color: rgb(0.2, 0.2, 0.2),
-    });
-    y -= 16;
+    let outputPage = pdf.addPage([A4.w, A4.h]);
+    mapping.outputPageNumbers.push(pdf.getPageCount());
+    let y = drawHeader(outputPage, source.pageNumber, false, font);
+    const safeText = normalizePdfText(source.text || '') || '[No translated text]';
+    const lines = wrapLines(safeText, usableWidth, font, fontSize);
 
-    const safe = normalizeText(p.text || '');
-    const lines = wrapLines(safe, usableWidth, font, fontSize);
-
-    for (const ln of lines) {
+    for (const line of lines) {
       if (y < MARGIN + fontSize) {
-        page = pdf.addPage([A4.w, A4.h]);
-        y = A4.h - MARGIN;
-        page.drawText(`${header} (cont.)`, {
-          x: MARGIN,
-          y,
-          size: 10,
-          font: fontBold,
-          color: rgb(0.2, 0.2, 0.2),
-        });
-        y -= 16;
+        outputPage = pdf.addPage([A4.w, A4.h]);
+        mapping.outputPageNumbers.push(pdf.getPageCount());
+        y = drawHeader(outputPage, source.pageNumber, true, font);
       }
-      if (ln === '') {
-        y -= fontSize; // paragraph gap
+      if (!line) {
+        y -= fontSize + lineGap;
         continue;
       }
-      page.drawText(ln, { x: MARGIN, y, size: fontSize, font });
+
+      const rtl = isRtlLine(line);
+      const renderedLine = rtl ? prepareRtlLineForPdf(line) : line;
+      const lineWidth = font.widthOfTextAtSize(renderedLine, fontSize);
+      const x = rtl
+        ? Math.max(MARGIN, A4.w - MARGIN - lineWidth)
+        : MARGIN;
+      outputPage.drawText(renderedLine, { x, y, size: fontSize, font });
       y -= fontSize + lineGap;
     }
   }
 
   const bytes = await pdf.save();
   await fs.writeFile(outPath, Buffer.from(bytes));
-  return outPath;
+  return { outputPath: outPath, pageMap };
 }

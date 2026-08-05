@@ -3,6 +3,8 @@ export type PageRecord = {
   originalText: string;
   translatedText?: string;
   needsOcr: boolean;
+  /** Refuse a partial translation if OCR cannot expand an artifact/repeated scan overlay. */
+  requiresRecoveredScanText?: boolean;
   status: 'pending' | 'extracted' | 'translated' | 'failed';
 };
 
@@ -23,4 +25,14 @@ export type JobState = {
   createdAt: number;
   error?: string;
   stopRequested?: boolean;
+};
+
+export type SourcePageMapping = {
+  sourcePageNumber: number;
+  outputPageNumbers: number[];
+};
+
+export type TranslatedPdfResult = {
+  outputPath: string;
+  pageMap: SourcePageMapping[];
 };

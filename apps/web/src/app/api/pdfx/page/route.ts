@@ -1,38 +1,49 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getPrisma } from "@/lib/db";
-import { getServerSession } from "next-auth";
-import { authOptions } from "@/lib/nextauth-options";
+import { esgPrisma } from "@esgcredit/db-esg";
+import { requirePdfxUser } from "@/lib/pdfx/auth";
+import { isUuid } from "@/lib/jobs/queue";
+import { MAX_PDF_PAGES } from "@/lib/pdfx/fs";
 
 export const runtime = "nodejs";
 
 export async function GET(req: NextRequest) {
-  const session = await getServerSession(authOptions);
-  if (!session?.user?.email) return NextResponse.json({ success: false }, { status: 401 });
-  
-  const prisma = getPrisma("esg");
-  const user = await (prisma as any).users.findUnique({
-    where: { email: session.user.email }
-  });
-  
-  if (!user) {
-    return NextResponse.json({ success: false, error: "User not found" }, { status: 404 });
-  }
-  
-  const userId = user.id;
+  const auth = await requirePdfxUser();
+  if (auth.response) return auth.response;
   const jobId = req.nextUrl.searchParams.get("jobId")!;
   const page = Number(req.nextUrl.searchParams.get("page") || 1);
+  if (!isUuid(jobId) || !Number.isSafeInteger(page) || page < 1 || page > MAX_PDF_PAGES) {
+    return NextResponse.json({ success: false, error: "Invalid query parameters" }, { status: 400 });
+  }
 
-  const row = await (prisma as any).pdf_translation_jobs.findUnique({ where: { id: jobId } });
-  if (!row || row.user_id !== userId)
+  const row = await esgPrisma.pdf_translation_jobs.findFirst({
+    where: { id: jobId, user_id: auth.userId },
+  });
+  if (!row)
     return NextResponse.json({ success: false, error: "Not found" }, { status: 404 });
 
-  const list = (row.translated_pages as any[]) || [];
-  const item = list.find((p) => p?.page_number === page) || null;
+  const list = Array.isArray(row.translated_pages) ? row.translated_pages : [];
+  if (row.total_pages && page > row.total_pages) {
+    return NextResponse.json({ success: false, error: "Page not found" }, { status: 404 });
+  }
+  const item = list.find((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const record = value as Record<string, unknown>;
+    return Number(record.pageNumber ?? record.page_number) === page;
+  });
+  const record = item && typeof item === "object" && !Array.isArray(item)
+    ? item as Record<string, unknown>
+    : null;
 
-  return NextResponse.json({
+  const response = NextResponse.json({
     success: true,
     page,
-    originalText: item?.original_text ?? "",
-    translatedText: item?.translated_text ?? "",
+    originalText: stringValue(record?.originalText ?? record?.original_text),
+    translatedText: stringValue(record?.translatedText ?? record?.translated_text),
   });
+  response.headers.set("Cache-Control", "private, no-store");
+  return response;
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === "string" ? value : "";
 }

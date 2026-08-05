@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
+import { isPdfxActiveStatus, isPdfxTerminalStatus } from '@/lib/pdfx/constants';
 import { 
   ChevronLeft, 
   ChevronRight, 
@@ -14,6 +15,7 @@ import {
   ArrowLeft, 
   Copy, 
   Check,
+  XCircle,
   Search,
   ZoomIn,
   ZoomOut,
@@ -33,25 +35,87 @@ export default function PdfView() {
   const [page, setPage] = useState(1);
   const [mode, setMode] = useState<'single' | 'continuous'>('single');
   const [loading, setLoading] = useState(true);
+  const [jobStatus, setJobStatus] = useState('queued');
+  const [jobMessage, setJobMessage] = useState('Loading translation…');
+  const [jobProgress, setJobProgress] = useState(0);
+  const [loadError, setLoadError] = useState('');
   const [copiedText, setCopiedText] = useState<string | null>(null);
   const [fontSize, setFontSize] = useState(14);
   const [searchTerm, setSearchTerm] = useState('');
 
   useEffect(() => {
-    (async () => {
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let controller: AbortController | null = null;
+    let failures = 0;
+
+    const load = async () => {
+      controller = new AbortController();
       try {
-        const res = await fetch(`/api/pdfx/pages?jobId=${jobId}`);
-        const json = await res.json();
-        if (json.success) {
-          const sorted = (json.pages as PagePayload[]).sort((a, b) => a.pageNumber - b.pageNumber);
-          setPages(sorted);
+        const statusResponse = await fetch(`/api/pdfx/status?jobId=${encodeURIComponent(jobId)}`, {
+          headers: { Accept: 'application/json' },
+          cache: 'no-store',
+          signal: controller.signal,
+        });
+        const statusPayload = await readJson(statusResponse);
+        if (!statusResponse.ok) {
+          throw new Error(apiError(statusPayload, `Unable to load translation (${statusResponse.status})`));
         }
-      } catch (error) {
-        console.error('Failed to load pages:', error);
-      } finally {
-        setLoading(false);
+        const state = readJobState(statusPayload);
+        if (disposed) return;
+
+        failures = 0;
+        setJobStatus(state.status);
+        setJobMessage(state.message || humanizeStatus(state.status));
+        setJobProgress(Math.max(0, Math.min(state.progress, 100)));
+
+        if (state.status === 'completed') {
+          const pagesResponse = await fetch(`/api/pdfx/pages?jobId=${encodeURIComponent(jobId)}`, {
+            headers: { Accept: 'application/json' },
+            cache: 'no-store',
+            signal: controller.signal,
+          });
+          const pagesPayload = await readJson(pagesResponse);
+          if (!pagesResponse.ok) {
+            throw new Error(apiError(pagesPayload, `Unable to load pages (${pagesResponse.status})`));
+          }
+          const loadedPages = readPages(pagesPayload);
+          if (!disposed) {
+            setPages(loadedPages);
+            setPage(loadedPages[0]?.pageNumber ?? 1);
+            setLoading(false);
+          }
+          return;
+        }
+
+        if (isPdfxTerminalStatus(state.status)) {
+          setLoading(false);
+          return;
+        }
+        if (!isPdfxActiveStatus(state.status)) {
+          throw new Error(`The service returned an unknown job status: ${state.status}`);
+        }
+
+        timer = setTimeout(() => void load(), 1_500);
+      } catch (caught) {
+        if (disposed || controller?.signal.aborted) return;
+        failures += 1;
+        if (failures < 3) {
+          setJobMessage(`Connection interrupted. Retrying (${failures}/3)…`);
+          timer = setTimeout(() => void load(), 1_500);
+        } else {
+          setLoadError(caught instanceof Error ? caught.message : 'Unable to load this translation');
+          setLoading(false);
+        }
       }
-    })();
+    };
+
+    void load();
+    return () => {
+      disposed = true;
+      if (timer) clearTimeout(timer);
+      controller?.abort();
+    };
   }, [jobId]);
 
   const total = pages.length;
@@ -81,8 +145,64 @@ export default function PdfView() {
     return (
       <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50/30 to-purple-50/20">
         <div className="flex items-center justify-center h-64">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div>
-          <span className="ml-3 text-gray-600">Loading PDF pages...</span>
+          <div className="w-full max-w-md rounded-xl border border-blue-100 bg-white p-6 shadow-sm">
+            <div className="flex items-center gap-3">
+              <div className="h-8 w-8 animate-spin rounded-full border-2 border-blue-600 border-t-transparent" />
+              <div className="min-w-0 flex-1">
+                <p className="font-medium text-gray-900">{humanizeStatus(jobStatus)}</p>
+                <p className="truncate text-sm text-gray-600">{jobMessage}</p>
+              </div>
+              <span className="text-sm font-medium text-gray-700">{jobProgress}%</span>
+            </div>
+            <div className="mt-4 h-2 overflow-hidden rounded-full bg-gray-200">
+              <div className="h-full rounded-full bg-blue-600 transition-all" style={{ width: `${jobProgress}%` }} />
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (loadError || jobStatus !== 'completed') {
+    const cancelled = jobStatus === 'cancelled' || jobStatus === 'stopped';
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50/30 to-purple-50/20 px-6 py-16">
+        <div className="mx-auto max-w-xl rounded-2xl border border-white/50 bg-white/90 p-8 text-center shadow-xl">
+          <XCircle className={`mx-auto h-12 w-12 ${cancelled ? 'text-gray-500' : 'text-red-500'}`} />
+          <h1 className="mt-4 text-xl font-bold text-gray-900">
+            {cancelled ? 'Translation cancelled' : 'Unable to open translation'}
+          </h1>
+          <p role="alert" className="mt-2 text-sm text-gray-600">
+            {loadError || jobMessage || humanizeStatus(jobStatus)}
+          </p>
+          <Link href="/esg/pdfx" className="mt-6 inline-flex items-center gap-2 rounded-lg bg-gray-900 px-4 py-2 text-sm font-medium text-white hover:bg-gray-800">
+            <ArrowLeft className="h-4 w-4" />
+            Back to PDF Translator
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  if (pages.length === 0) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50/30 to-purple-50/20 px-6 py-16">
+        <div className="mx-auto max-w-xl rounded-2xl border border-white/50 bg-white/90 p-8 text-center shadow-xl">
+          <BookOpen className="mx-auto h-12 w-12 text-gray-400" />
+          <h1 className="mt-4 text-xl font-bold text-gray-900">No page text is available</h1>
+          <p className="mt-2 text-sm text-gray-600">
+            The translation completed, but it did not produce readable page text. You can still download the generated PDF.
+          </p>
+          <div className="mt-6 flex flex-col justify-center gap-3 sm:flex-row">
+            <Link href="/esg/pdfx" className="inline-flex items-center justify-center gap-2 rounded-lg bg-gray-900 px-4 py-2 text-sm font-medium text-white hover:bg-gray-800">
+              <ArrowLeft className="h-4 w-4" />
+              Back
+            </Link>
+            <a href={`/api/pdfx/download?jobId=${encodeURIComponent(jobId)}`} className="inline-flex items-center justify-center gap-2 rounded-lg bg-green-600 px-4 py-2 text-sm font-medium text-white hover:bg-green-700">
+              <Download className="h-4 w-4" />
+              Download PDF
+            </a>
+          </div>
         </div>
       </div>
     );
@@ -163,7 +283,10 @@ export default function PdfView() {
                   type="text"
                   placeholder="Search in pages..."
                   value={searchTerm}
-                  onChange={(e) => setSearchTerm(e.target.value)}
+                  onChange={(e) => {
+                    setSearchTerm(e.target.value);
+                    if (e.target.value) setMode('continuous');
+                  }}
                   className="pl-10 pr-4 py-2 bg-white/80 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-sm w-64"
                 />
               </div>
@@ -390,4 +513,64 @@ export default function PdfView() {
       </div>
     </div>
   );
+}
+
+async function readJson(response: Response): Promise<unknown> {
+  return response.json().catch(() => null);
+}
+
+function apiError(payload: unknown, fallback: string): string {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return fallback;
+  const error = (payload as Record<string, unknown>).error;
+  return typeof error === 'string' && error.trim() ? error : fallback;
+}
+
+function readJobState(payload: unknown): { status: string; message: string; progress: number } {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error('The status service returned an invalid response');
+  }
+  const root = payload as Record<string, unknown>;
+  if (root.success !== true || !root.job || typeof root.job !== 'object' || Array.isArray(root.job)) {
+    throw new Error(apiError(payload, 'The status service returned an invalid response'));
+  }
+  const job = root.job as Record<string, unknown>;
+  if (typeof job.status !== 'string' || typeof job.progress !== 'number') {
+    throw new Error('The status service returned an invalid job state');
+  }
+  return {
+    status: job.status,
+    message: typeof job.message === 'string' ? job.message : '',
+    progress: Number.isFinite(job.progress) ? job.progress : 0,
+  };
+}
+
+function readPages(payload: unknown): PagePayload[] {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error('The page service returned an invalid response');
+  }
+  const root = payload as Record<string, unknown>;
+  if (root.success !== true || !Array.isArray(root.pages)) {
+    throw new Error(apiError(payload, 'The page service returned an invalid response'));
+  }
+
+  const pages = root.pages.map((value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('The page service returned an invalid page');
+    }
+    const page = value as Record<string, unknown>;
+    if (!Number.isSafeInteger(page.pageNumber) || Number(page.pageNumber) < 1) {
+      throw new Error('The page service returned an invalid page number');
+    }
+    return {
+      pageNumber: Number(page.pageNumber),
+      originalText: typeof page.originalText === 'string' ? page.originalText : '',
+      translatedText: typeof page.translatedText === 'string' ? page.translatedText : '',
+    };
+  });
+
+  return pages.sort((left, right) => left.pageNumber - right.pageNumber);
+}
+
+function humanizeStatus(status: string): string {
+  return status.replace(/_/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
