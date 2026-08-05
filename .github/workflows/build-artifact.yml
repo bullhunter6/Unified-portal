@@ -92,6 +92,14 @@ jobs:
       - name: Apply migrations to the build databases
         run: pnpm db:migrate:deploy
 
+      # Load the same TypeScript import graph PM2 runs in production. This
+      # catches CJS/ESM loader failures that `next build` bundles around and
+      # therefore cannot detect.
+      - name: Check production worker startup
+        env:
+          OPENAI_API_KEY: build-placeholder-not-used
+        run: pnpm -C apps/web worker:check-db
+
       - name: Build web
         env:
           # The only value that truly matters: Next INLINES NEXT_PUBLIC_* into
