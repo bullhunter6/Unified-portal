@@ -10,6 +10,7 @@
   },
   "include": [
     "src/esg-driver-worker-bootstrap.mts",
-    "src/esg-driver-worker.mts"
+    "src/esg-driver-worker.mts",
+    "src/types/**/*.d.ts"
   ]
 }

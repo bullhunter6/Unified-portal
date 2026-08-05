@@ -9,6 +9,7 @@ export const BACKGROUND_JOB_TYPES = [
 ] as const;
 
 export type BackgroundJobType = (typeof BACKGROUND_JOB_TYPES)[number];
+export type BackgroundWorkerKind = "generic" | "esg_driver";
 export type BackgroundJobStatus =
   | "queued"
   | "processing"
@@ -101,16 +102,51 @@ export class JobConcurrencyLimitError extends Error {
   }
 }
 
+export interface EnqueueBackgroundJobArgs {
+  id: string;
+  jobType: BackgroundJobType;
+  userId: number;
+  payload?: object;
+  inputData?: Buffer;
+  maxAttempts?: number;
+  idempotencyKey?: string;
+}
+
+/**
+ * Build the strict Prisma create payload used when a queue row must be committed
+ * atomically with a feature-specific domain row. Unlike the standalone raw
+ * enqueue helper, Prisma's create fails on an idempotency conflict so the whole
+ * batch rolls back instead of leaving a domain row without a queue row.
+ */
+export function createBackgroundJobData(args: EnqueueBackgroundJobArgs) {
+  const queuedAt = new Date();
+  return {
+    id: args.id,
+    job_type: args.jobType,
+    user_id: args.userId,
+    payload_json: (args.payload ?? {}) as any,
+    input_data: args.inputData ?? null,
+    max_attempts: args.maxAttempts ?? 3,
+    idempotency_key: args.idempotencyKey ?? `${args.jobType}:${args.id}`,
+    status: "queued",
+    available_at: queuedAt,
+    created_at: queuedAt,
+    updated_at: queuedAt,
+  };
+}
+
+export function rethrowBackgroundJobEnqueueError(error: unknown): never {
+  if (
+    error instanceof Error &&
+    error.message.includes("background_job_concurrency_limit")
+  ) {
+    throw new JobConcurrencyLimitError();
+  }
+  throw error;
+}
+
 export async function enqueueBackgroundJob(
-  args: {
-    id: string;
-    jobType: BackgroundJobType;
-    userId: number;
-    payload?: object;
-    inputData?: Buffer;
-    maxAttempts?: number;
-    idempotencyKey?: string;
-  },
+  args: EnqueueBackgroundJobArgs,
   database: RawDatabaseClient = esgPrisma,
 ): Promise<void> {
   try {
@@ -134,10 +170,7 @@ export async function enqueueBackgroundJob(
       ON CONFLICT (idempotency_key) DO NOTHING
     `;
   } catch (error) {
-    if (error instanceof Error && error.message.includes("background_job_concurrency_limit")) {
-      throw new JobConcurrencyLimitError();
-    }
-    throw error;
+    rethrowBackgroundJobEnqueueError(error);
   }
 }
 
@@ -145,14 +178,28 @@ export async function claimBackgroundJobs(
   workerId: string,
   limit = 2,
   leaseSeconds = 90,
+  jobTypes: readonly BackgroundJobType[] = BACKGROUND_JOB_TYPES,
+  workerKind: BackgroundWorkerKind = "generic",
 ): Promise<ClaimedBackgroundJob[]> {
   if (!workerId.trim()) throw new Error("Background job worker id is required");
+  const safeJobTypes = Array.from(new Set(jobTypes));
+  if (safeJobTypes.length === 0) return [];
+  if (safeJobTypes.some((jobType) => !BACKGROUND_JOB_TYPES.includes(jobType))) {
+    throw new Error("Unsupported background job type filter");
+  }
+  if (
+    workerKind === "esg_driver" &&
+    safeJobTypes.some((jobType) => jobType !== "esg_driver")
+  ) {
+    throw new Error("The ESG Drivers worker may only claim esg_driver jobs");
+  }
   const safeLimit = Math.max(1, Math.min(limit, 20));
   const safeLease = Math.max(30, Math.min(leaseSeconds, 600));
   // The process id is diagnostic identity, not a fencing token. Rotate an
-  // opaque token on every claim call so a still-running attempt cannot regain
-  // ownership when this same process later reclaims its expired row.
-  const leaseOwner = randomUUID();
+  // opaque attempt token on every claim call. The worker-kind prefix is also
+  // enforced by the database routing guard so an obsolete specialized worker
+  // cannot steal a PDF or workbook job.
+  const leaseOwner = `${workerKind}:${randomUUID()}`;
 
   // Finalize abandoned jobs that were cancelled while their previous worker was
   // unavailable. Active workers observe cancel_requested via checkpoints.
@@ -165,6 +212,7 @@ export async function claimBackgroundJobs(
     SET status = 'cancelled', completed_at = now(), lease_owner = NULL,
         lease_expires_at = NULL, updated_at = now()
     WHERE cancel_requested = TRUE
+      AND job_type = ANY(${safeJobTypes}::text[])
       AND status IN ('queued', 'processing')
       AND (status = 'queued' OR lease_expires_at IS NULL OR lease_expires_at < now())
     RETURNING id::text, job_type, user_id
@@ -182,6 +230,7 @@ export async function claimBackgroundJobs(
         last_error = COALESCE(last_error, 'Worker lease expired after final attempt'),
         updated_at = now()
     WHERE status = 'processing'
+      AND job_type = ANY(${safeJobTypes}::text[])
       AND attempts >= max_attempts
       AND (lease_expires_at IS NULL OR lease_expires_at < now())
     RETURNING id::text, job_type, user_id
@@ -202,6 +251,7 @@ export async function claimBackgroundJobs(
           AND (lease_expires_at IS NULL OR lease_expires_at < now())
         )
       )
+        AND job_type = ANY(${safeJobTypes}::text[])
         AND attempts < max_attempts
         AND cancel_requested = FALSE
       ORDER BY available_at ASC, created_at ASC
@@ -346,6 +396,109 @@ export async function completeBackgroundJob(
   return updated > 0;
 }
 
+/**
+ * Commit the PDF domain result and its queue transition together. The PDF bytes
+ * live only on pdf_translation_jobs; background_jobs records lifecycle/result
+ * metadata without retaining a duplicate output blob.
+ */
+export async function completePdfTranslationJob(
+  id: string,
+  userId: number,
+  leaseOwner: string,
+  args: {
+    outputPdf: Buffer;
+    translatedPages: unknown;
+    result: unknown;
+    message: string;
+  },
+): Promise<void> {
+  const completion = await esgPrisma.$queryRaw<Array<{
+    queue_eligible: boolean;
+    domain_updated: boolean;
+    queue_completed: boolean;
+  }>>`
+    WITH eligible_queue AS MATERIALIZED (
+      SELECT id
+      FROM background_jobs
+      WHERE id = ${id}::uuid
+        AND job_type = 'pdf_translation'
+        AND user_id = ${userId}
+        AND status = 'processing'
+        AND lease_owner = ${leaseOwner}
+        AND lease_expires_at >= now()
+        AND cancel_requested = FALSE
+      FOR UPDATE
+    ),
+    updated_domain AS (
+      UPDATE pdf_translation_jobs AS domain
+      SET status = 'completed',
+          message = ${args.message},
+          progress = 100,
+          output_path = ${`db://pdf_translation_jobs/${id}/output`},
+          output_pdf = ${args.outputPdf},
+          translated_pages = ${JSON.stringify(args.translatedPages ?? null)}::jsonb,
+          completed_at = now(),
+          updated_at = now()
+      FROM eligible_queue AS queue
+      WHERE domain.id = queue.id
+        AND domain.user_id = ${userId}
+        AND domain.status IN ('queued', 'processing', 'completed')
+      RETURNING domain.id
+    ),
+    completed_queue AS (
+      UPDATE background_jobs AS queue
+      SET status = 'done',
+          progress = 100,
+          output_data = NULL,
+          result_json = ${JSON.stringify(args.result ?? null)}::jsonb,
+          lease_owner = NULL,
+          lease_expires_at = NULL,
+          heartbeat_at = now(),
+          completed_at = now(),
+          updated_at = now()
+      FROM updated_domain AS domain
+      WHERE queue.id = domain.id
+      RETURNING queue.id
+    )
+    SELECT
+      EXISTS (SELECT 1 FROM eligible_queue) AS queue_eligible,
+      EXISTS (SELECT 1 FROM updated_domain) AS domain_updated,
+      EXISTS (SELECT 1 FROM completed_queue) AS queue_completed
+  `;
+
+  const result = completion[0];
+  if (result?.queue_completed) return;
+  if (result?.queue_eligible && !result.domain_updated) {
+    throw new Error("PDF translation record is missing or already terminal");
+  }
+  if (result?.queue_eligible) {
+    throw new Error("PDF background job could not be completed");
+  }
+
+  const state = await esgPrisma.$queryRaw<Array<{
+    cancel_requested: boolean;
+    lease_owner: string | null;
+    lease_valid: boolean;
+    status: BackgroundJobStatus;
+  }>>`
+    SELECT cancel_requested, lease_owner,
+           lease_expires_at >= now() AS lease_valid, status
+    FROM background_jobs
+    WHERE id = ${id}::uuid AND user_id = ${userId}
+    LIMIT 1
+  `;
+  const current = state[0];
+  if (
+    current?.cancel_requested &&
+    current.status === "processing" &&
+    current.lease_owner === leaseOwner &&
+    current.lease_valid
+  ) {
+    throw new JobCancelledError();
+  }
+  throw new JobLeaseLostError();
+}
+
 export async function failBackgroundJob(
   job: ClaimedBackgroundJob,
   error: string,
@@ -412,20 +565,46 @@ export async function requestBackgroundJobCancellation(
 ): Promise<BackgroundJobStatus | null> {
   if (!isUuid(id)) return null;
   const rows = await esgPrisma.$queryRaw<Array<{ status: BackgroundJobStatus }>>`
-    UPDATE background_jobs
-    SET cancel_requested = TRUE,
-        status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE status END,
-        progress = CASE WHEN status = 'queued' THEN 100 ELSE progress END,
-        lease_owner = CASE WHEN status = 'queued' THEN NULL ELSE lease_owner END,
-        lease_expires_at = CASE WHEN status = 'queued' THEN NULL ELSE lease_expires_at END,
-        completed_at = CASE WHEN status = 'queued' THEN now() ELSE completed_at END,
-        updated_at = now()
-    WHERE id = ${id}::uuid
-      AND user_id = ${userId}
-      AND status IN ('queued', 'processing')
-    RETURNING status
+    WITH requested AS (
+      UPDATE background_jobs
+      SET cancel_requested = TRUE,
+          status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE status END,
+          progress = CASE WHEN status = 'queued' THEN 100 ELSE progress END,
+          lease_owner = CASE WHEN status = 'queued' THEN NULL ELSE lease_owner END,
+          lease_expires_at = CASE WHEN status = 'queued' THEN NULL ELSE lease_expires_at END,
+          completed_at = CASE WHEN status = 'queued' THEN now() ELSE completed_at END,
+          updated_at = now()
+      WHERE id = ${id}::uuid
+        AND user_id = ${userId}
+        AND status IN ('queued', 'processing')
+      RETURNING status
+    )
+    SELECT status FROM requested
+    UNION ALL
+    SELECT status FROM background_jobs
+    WHERE id = ${id}::uuid AND user_id = ${userId}
+      AND NOT EXISTS (SELECT 1 FROM requested)
+    LIMIT 1
   `;
   return rows[0]?.status ?? null;
+}
+
+/** Clear stale queue blobs after the domain record has become authoritative. */
+export async function cleanupTerminalPdfJobBlobs(
+  retentionHours = 24 * 7,
+): Promise<number> {
+  const safeHours = Number.isFinite(retentionHours)
+    ? Math.max(1, Math.min(Math.floor(retentionHours), 24 * 365))
+    : 24 * 7;
+  const retentionSeconds = safeHours * 60 * 60;
+  return esgPrisma.$executeRaw`
+    UPDATE background_jobs
+    SET input_data = NULL, output_data = NULL, updated_at = now()
+    WHERE job_type = 'pdf_translation'
+      AND status IN ('done', 'error', 'cancelled')
+      AND completed_at < now() - (${retentionSeconds} * INTERVAL '1 second')
+      AND (input_data IS NOT NULL OR output_data IS NOT NULL)
+  `;
 }
 
 export async function deleteBackgroundJob(
@@ -514,7 +693,7 @@ async function synchronizeReapedJobs(
         where: {
           id: job.id,
           user_id: job.user_id,
-          status: { in: ["queued", "processing"] },
+          status: { in: ["queued", "processing", "cancelling"] },
         },
         data: { status, message, progress: 100, completed_at: new Date() },
       });
@@ -581,6 +760,6 @@ export async function reconcileTerminalDomainJobs(): Promise<void> {
     WHERE queue.id = domain.id
       AND queue.job_type = 'pdf_translation'
       AND queue.status IN ('error', 'cancelled')
-      AND domain.status IN ('queued', 'processing')
+      AND domain.status IN ('queued', 'processing', 'cancelling')
   `;
 }

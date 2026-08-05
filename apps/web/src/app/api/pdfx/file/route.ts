@@ -1,42 +1,36 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getPrisma } from "@/lib/db";
-import { getServerSession } from "next-auth";
-import { authOptions } from "@/lib/nextauth-options";
-import { jobInputPath } from "@/lib/pdfx/fs";
-import fs from "node:fs";
+import { esgPrisma } from "@esgcredit/db-esg";
+import { requirePdfxUser } from "@/lib/pdfx/auth";
+import { getBackgroundJob, isUuid } from "@/lib/jobs/queue";
+import { buildPdfxContentDisposition } from "@/lib/pdfx/constants";
 
 export const runtime = "nodejs";
 
 export async function GET(req: NextRequest) {
-  const session = await getServerSession(authOptions);
-  if (!session?.user?.email) return NextResponse.json({ success: false }, { status: 401 });
-  
-  const prisma = getPrisma("esg");
-  const user = await (prisma as any).users.findUnique({
-    where: { email: session.user.email }
-  });
-  
-  if (!user) {
-    return NextResponse.json({ success: false, error: "User not found" }, { status: 404 });
-  }
-  
-  const userId = user.id;
+  const auth = await requirePdfxUser();
+  if (auth.response) return auth.response;
   const jobId = req.nextUrl.searchParams.get("jobId")!;
-  if (!jobId) return NextResponse.json({ success: false, error: "Missing jobId" }, { status: 400 });
+  if (!isUuid(jobId)) {
+    return NextResponse.json({ success: false, error: "Invalid jobId" }, { status: 400 });
+  }
 
-  const row = await (prisma as any).pdf_translation_jobs.findUnique({ where: { id: jobId } });
-  if (!row || row.user_id !== userId) return NextResponse.json({ success: false }, { status: 404 });
-
-  const p = jobInputPath(row.stored_filename);
-  if (!fs.existsSync(p)) return NextResponse.json({ success: false }, { status: 404 });
-
-  const stat = fs.statSync(p);
-  const stream = fs.createReadStream(p);
-  return new Response(stream as any, {
+  const [row, queueJob] = await Promise.all([
+    esgPrisma.pdf_translation_jobs.findFirst({
+      where: { id: jobId, user_id: auth.userId },
+      select: { filename: true },
+    }),
+    getBackgroundJob(jobId, auth.userId),
+  ]);
+  if (!row || !queueJob?.inputData) {
+    return NextResponse.json({ success: false }, { status: 404 });
+  }
+  return new Response(new Uint8Array(queueJob.inputData), {
     headers: {
       "Content-Type": "application/pdf",
-      "Content-Length": String(stat.size),
-      "Content-Disposition": `inline; filename="${encodeURIComponent(row.filename)}"`,
+      "Content-Length": String(queueJob.inputData.length),
+      "Content-Disposition": buildPdfxContentDisposition("inline", row.filename),
+      "Cache-Control": "private, no-store",
+      "X-Content-Type-Options": "nosniff",
     },
   });
 }
