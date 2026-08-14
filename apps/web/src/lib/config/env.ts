@@ -10,6 +10,8 @@ export const envSchema = z
     EMAIL_PASS: optionalString,
     EMAIL_USER: optionalString,
     ENABLE_ALERT_SCHEDULER: optionalString,
+    ESG_EVENTS_DIGEST_ENABLED: optionalString,
+    ESG_EVENTS_DIGEST_TEST_RECIPIENT: optionalString,
     ESG_DRIVER_SELECTION_MODE: z.enum(["catalog", "legacy"]).optional(),
     GOOGLE_API_KEY_2: optionalString,
     GOOGLE_CSE_ID_2: optionalString,
@@ -43,6 +45,8 @@ export interface EnvConfig {
   EMAIL_PASS?: string;
   EMAIL_USER?: string;
   ENABLE_ALERT_SCHEDULER?: string;
+  ESG_EVENTS_DIGEST_ENABLED?: string;
+  ESG_EVENTS_DIGEST_TEST_RECIPIENT?: string;
   ESG_DRIVER_SELECTION_MODE: "catalog" | "legacy";
   GOOGLE_API_KEY_2?: string;
   GOOGLE_CSE_ID_2?: string;
@@ -87,6 +91,8 @@ export function loadEnv(rawEnv: RawEnv): Readonly<EnvConfig> {
     EMAIL_PASS: raw.EMAIL_PASS,
     EMAIL_USER: raw.EMAIL_USER,
     ENABLE_ALERT_SCHEDULER: raw.ENABLE_ALERT_SCHEDULER,
+    ESG_EVENTS_DIGEST_ENABLED: raw.ESG_EVENTS_DIGEST_ENABLED,
+    ESG_EVENTS_DIGEST_TEST_RECIPIENT: raw.ESG_EVENTS_DIGEST_TEST_RECIPIENT,
     ESG_DRIVER_SELECTION_MODE: raw.ESG_DRIVER_SELECTION_MODE || "catalog",
     GOOGLE_API_KEY_2: raw.GOOGLE_API_KEY_2,
     GOOGLE_CSE_ID_2: raw.GOOGLE_CSE_ID_2,

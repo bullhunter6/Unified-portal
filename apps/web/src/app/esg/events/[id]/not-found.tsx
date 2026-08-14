@@ -1,29 +1,29 @@
+import { ArrowLeft, CalendarX2 } from "lucide-react";
 import Link from "next/link";
-import { ArrowLeft } from "lucide-react";
 
 export default function EventNotFound() {
   return (
-    <main className="mx-auto max-w-[1200px] px-6 py-16">
-      <div className="text-center">
-        <div className="mb-8">
-          <div className="mx-auto mb-4 flex h-20 w-20 items-center justify-center rounded-full bg-[var(--surface-2)]">
-            <span className="text-2xl font-bold text-[var(--text-muted)]">404</span>
-          </div>
-          <h1 className="mb-4 text-3xl font-bold text-[var(--text)]">Event Not Found</h1>
-          <p className="text-[var(--text-muted)] max-w-md mx-auto">
-            The event you&apos;re looking for doesn&apos;t exist or may have been removed.
-          </p>
+    <main className="min-h-[70vh] overflow-x-clip bg-background px-4 py-16 text-foreground sm:px-6">
+      <div className="mx-auto max-w-2xl rounded-3xl border border-border bg-card p-8 shadow-sm sm:p-12">
+        <div className="flex h-12 w-12 items-center justify-center rounded-full bg-muted text-muted-foreground">
+          <CalendarX2 aria-hidden="true" className="h-6 w-6" />
         </div>
-        
-        <div className="flex gap-4 justify-center">
-          <Link 
-            href="/esg/events"
-            className="btn btn-primary inline-flex items-center gap-2"
-          >
-            <ArrowLeft size={16} />
-            Back to ESG Events
-          </Link>
-        </div>
+        <p className="mt-7 text-xs font-semibold uppercase tracking-[0.2em] text-primary">
+          Entry unavailable
+        </p>
+        <h1 className="mt-2 font-[family-name:var(--font-event-editorial)] text-3xl font-semibold tracking-tight sm:text-4xl">
+          This event is not in the ledger
+        </h1>
+        <p className="mt-4 max-w-xl leading-7 text-muted-foreground">
+          It may have been removed, or the event address may be malformed. Browse the current ledger to find another event.
+        </p>
+        <Link
+          href="/esg/events"
+          className="mt-8 inline-flex min-h-11 items-center justify-center gap-2 rounded-full bg-primary px-5 py-2.5 text-sm font-semibold text-primary-foreground outline-none transition-colors hover:bg-primary/90 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+        >
+          <ArrowLeft aria-hidden="true" className="h-4 w-4" />
+          Back to ESG events
+        </Link>
       </div>
     </main>
   );

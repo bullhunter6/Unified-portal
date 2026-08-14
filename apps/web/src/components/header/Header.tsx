@@ -18,7 +18,7 @@ export default function Header({ domain }: { domain: "esg" | "credit" }) {
   
   return (
     <header className={`sticky top-0 z-50 ${isESG ? 'bg-gradient-to-r from-emerald-600 to-teal-600' : 'bg-gradient-to-r from-slate-700 to-slate-800'}`}>
-      <div className="mx-auto flex max-w-[1400px] items-center justify-between px-6 h-16">
+      <div className={`mx-auto flex h-16 max-w-[1400px] items-center justify-between ${isESG ? "px-3 sm:px-6" : "px-6"}`}>
         {/* Logo */}
         <Link href={base} className="flex items-center gap-3 group">
           <div className={`flex h-10 w-10 items-center justify-center rounded-xl ${isESG ? 'bg-white/20' : 'bg-white/10'} backdrop-blur-sm transition-transform group-hover:scale-105`}>
@@ -28,7 +28,7 @@ export default function Header({ domain }: { domain: "esg" | "credit" }) {
               <TrendingUp className="h-5 w-5 text-white" />
             )}
           </div>
-          <div className="flex flex-col">
+          <div className={isESG ? "hidden min-[420px]:flex min-[420px]:flex-col" : "flex flex-col"}>
             <span className="text-lg font-bold text-white tracking-tight">
               {isESG ? 'ESG' : 'Credit Rating'}
             </span>
@@ -56,7 +56,7 @@ export default function Header({ domain }: { domain: "esg" | "credit" }) {
         </nav>
 
         {/* Right Actions */}
-        <div className="flex items-center gap-3">
+        <div className={`flex items-center ${isESG ? "gap-2 sm:gap-3" : "gap-3"}`}>
           <DomainSwitch />
           <UserMenu domain={domain} />
         </div>
