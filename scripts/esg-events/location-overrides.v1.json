@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "description": "Reviewed ESG event normalization overrides. Keys are '<source>:<event_id>' when event_id exists, otherwise 'id:<database id>'. Every entry must cite an absolute source URL.",
+  "events": {}
+}

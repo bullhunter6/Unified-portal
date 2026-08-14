@@ -1,7 +1,13 @@
 import os from "node:os";
 import { randomUUID } from "node:crypto";
-import { esgPrisma } from "@esgcredit/db-esg";
+import {
+  connectEsgWithRetry,
+  esgPrisma,
+  isTransientPrismaConnectivityError,
+} from "@esgcredit/db-esg";
+import { processEmailQueue } from "@/lib/alerts/email-queue";
 import { runEsgDriverGenerationJob } from "@/lib/esg-drivers/runner";
+import { queueDueEsgEventsWeeklyDigest } from "@/lib/esg-events/weekly-digest";
 import {
   failEsgDriverJob,
   isRetryableEsgDriverFailure,
@@ -20,12 +26,20 @@ import {
   type ClaimedBackgroundJob,
 } from "@/lib/jobs/queue";
 import { processPdfTranslationJob } from "@/lib/pdfx/pipeline";
+import {
+  createTransientPollState,
+  pollWithTransientBackoff,
+} from "@/lib/jobs/worker-resilience";
 
 const workerId = `${os.hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`;
 const runOnce = process.argv.includes("--once");
 const checkDatabasesOnly = process.argv.includes("--check-db");
 const concurrency = boundedInteger(process.env.WORKER_CONCURRENCY, 2, 1, 10);
+const emailPollMs = boundedInteger(process.env.WORKER_EMAIL_POLL_MS, 5_000, 1_000, 60_000);
+const esgEventsDigestPollMs = 60_000;
 let stopping = false;
+let lastEmailPoll = 0;
+let lastEsgEventsDigestPoll = 0;
 
 process.on("SIGINT", () => {
   stopping = true;
@@ -35,36 +49,80 @@ process.on("SIGTERM", () => {
 });
 
 async function main(): Promise<void> {
-  await esgPrisma.$connect();
+  await connectEsgWithRetry();
   await verifyWorkerSchema();
   await reconcileTerminalDomainJobs();
   console.log(`[esg-driver-worker] started ${workerId} (concurrency=${concurrency})`);
 
   const activeJobs = new Set<Promise<void>>();
+  const claimPollState = createTransientPollState();
+  let emailWork: Promise<void> | null = null;
+  let esgEventsDigestWork: Promise<void> | null = null;
   do {
     if (!stopping) {
       const availableSlots = concurrency - activeJobs.size;
       if (availableSlots > 0) {
-        const jobs = await claimBackgroundJobs(
-          workerId,
-          availableSlots,
-          90,
-          ["esg_driver", "pdf_translation"],
-          "generic",
+        const claimResult = await pollWithTransientBackoff(
+          claimPollState,
+          () => claimBackgroundJobs(
+            workerId,
+            availableSlots,
+            90,
+            ["esg_driver", "pdf_translation"],
+            "generic",
+          ),
+          isTransientPrismaConnectivityError,
+          { retryTransientErrors: !runOnce },
         );
-        for (const job of jobs) {
-          let task!: Promise<void>;
-          task = executeJob(job)
-            .catch((error) => {
-              console.error(
-                `[esg-driver-worker] unhandled execution error for ${job.id}`,
-                error,
-              );
-            })
-            .finally(() => activeJobs.delete(task));
-          activeJobs.add(task);
+
+        if (claimResult.status === "unavailable" && claimResult.firstFailure) {
+          console.warn(
+            `[esg-driver-worker] ESG database unavailable; queue polling paused and will ` +
+            `retry in ${claimResult.retryDelayMs}ms: ${workerErrorMessage(claimResult.error)}`,
+          );
+        } else if (claimResult.status === "success") {
+          if (claimResult.recovered) {
+            console.log("[esg-driver-worker] ESG database connection restored; queue polling resumed");
+          }
+          for (const job of claimResult.value) {
+            let task!: Promise<void>;
+            task = executeJob(job)
+              .catch((error) => {
+                console.error(
+                  `[esg-driver-worker] unhandled execution error for ${job.id}`,
+                  error,
+                );
+              })
+              .finally(() => activeJobs.delete(task));
+            activeJobs.add(task);
+          }
         }
       }
+    }
+
+    if (!emailWork && Date.now() - lastEmailPoll >= emailPollMs) {
+      lastEmailPoll = Date.now();
+      emailWork = processEmailQueue(`${workerId}:email`, 10)
+        .then(() => undefined)
+        .catch((error) => console.error("[esg-driver-worker] email queue poll failed", error))
+        .finally(() => {
+          emailWork = null;
+        });
+    }
+    if (
+      !esgEventsDigestWork &&
+      Date.now() - lastEsgEventsDigestPoll >= esgEventsDigestPollMs
+    ) {
+      lastEsgEventsDigestPoll = Date.now();
+      esgEventsDigestWork = Promise.resolve()
+        .then(() => queueDueEsgEventsWeeklyDigest())
+        .then(() => undefined)
+        .catch((error) => {
+          console.error("[esg-driver-worker] ESG events digest due-check failed", error);
+        })
+        .finally(() => {
+          esgEventsDigestWork = null;
+        });
     }
 
     if (runOnce || stopping) break;
@@ -74,9 +132,17 @@ async function main(): Promise<void> {
     ]);
   } while (!stopping);
 
-  await Promise.allSettled(activeJobs);
+  await Promise.allSettled([
+    ...activeJobs,
+    ...(emailWork ? [emailWork] : []),
+    ...(esgEventsDigestWork ? [esgEventsDigestWork] : []),
+  ]);
   await esgPrisma.$disconnect();
   console.log(`[esg-driver-worker] stopped ${workerId}`);
+}
+
+function workerErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 async function executeJob(job: ClaimedBackgroundJob): Promise<void> {
@@ -159,6 +225,9 @@ async function verifyWorkerSchema(): Promise<void> {
     "esg_driver_jobs",
     "pdf_translation_jobs",
     "api_usage_buckets",
+    "alert_history",
+    "email_queue",
+    "esg_event_digest_recipients",
   ];
   const tables = await esgPrisma.$queryRaw<Array<{ name: string; present: boolean }>>`
     SELECT name, to_regclass('public.' || name) IS NOT NULL AS present
@@ -178,7 +247,7 @@ async function verifyWorkerSchema(): Promise<void> {
 
   if (missingTables.length || missingColumns.length) {
     throw new Error(
-      `ESG Drivers migrations are not deployed (${[
+      `Worker migrations are not deployed (${[
         ...missingTables.map((name) => `table ${name}`),
         ...missingColumns.map((name) => `column esg_driver_jobs.${name}`),
       ].join(", ")}). Run pnpm db:migrate:deploy.`,
@@ -219,8 +288,7 @@ function boundedInteger(
 }
 
 if (checkDatabasesOnly) {
-  esgPrisma
-    .$connect()
+  connectEsgWithRetry()
     .then(verifyWorkerSchema)
     .then(() => console.log("[esg-driver-worker] database and migration check passed"))
     .then(() => esgPrisma.$disconnect())

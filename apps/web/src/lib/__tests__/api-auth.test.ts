@@ -18,7 +18,7 @@ async function loadApiAuth({
   session = null,
 }: {
   cronSecret?: string;
-  dbUser?: { is_admin: boolean } | null;
+  dbUser?: { is_admin: boolean | null; is_active_db: boolean } | null;
   session?: MockSession | null;
 } = {}) {
   vi.resetModules();
@@ -70,20 +70,50 @@ describe("api auth guards", () => {
     expect(result.session).toBe(session);
   });
 
-  it("requireAdminSession accepts admin role claims without querying the database", async () => {
-    const session = { role: "admin", user: { email: "admin@example.com" } };
-    const { findUnique, requireAdminSession } = await loadApiAuth({ session });
+  it("requireUserSession derives a positive numeric user id from the session", async () => {
+    const session = { user: { id: "42", email: "user@example.com" } };
+    const { requireUserSession } = await loadApiAuth({ session });
 
-    const result = await requireAdminSession();
+    const result = await requireUserSession();
 
     expect(result.session).toBe(session);
-    expect(findUnique).not.toHaveBeenCalled();
+    expect(result.userId).toBe(42);
   });
 
-  it("requireAdminSession accepts users marked admin in the ESG database", async () => {
-    const session = { user: { email: "admin@example.com" } };
+  it("requireUserSession rejects missing or non-numeric user ids", async () => {
+    const { requireUserSession } = await loadApiAuth({
+      session: { user: { id: "not-a-number", email: "user@example.com" } },
+    });
+
+    const result = await requireUserSession();
+
+    expect(result.response?.status).toBe(401);
+  });
+
+  it("requireEmailSession returns a trimmed authenticated email", async () => {
+    const session = { user: { id: "42", email: " user@example.com " } };
+    const { requireEmailSession } = await loadApiAuth({ session });
+
+    const result = await requireEmailSession();
+
+    expect(result.session).toBe(session);
+    expect(result.email).toBe("user@example.com");
+  });
+
+  it("requireEmailSession rejects sessions without an email", async () => {
+    const { requireEmailSession } = await loadApiAuth({
+      session: { user: { id: "42" } },
+    });
+
+    const result = await requireEmailSession();
+
+    expect(result.response?.status).toBe(401);
+  });
+
+  it("requireAdminSession verifies an admin against current database state", async () => {
+    const session = { role: "admin", user: { id: "42", email: "admin@example.com" } };
     const { findUnique, requireAdminSession } = await loadApiAuth({
-      dbUser: { is_admin: true },
+      dbUser: { is_admin: true, is_active_db: true },
       session,
     });
 
@@ -91,15 +121,19 @@ describe("api auth guards", () => {
 
     expect(result.session).toBe(session);
     expect(findUnique).toHaveBeenCalledWith({
-      where: { email: "admin@example.com" },
-      select: { is_admin: true },
+      where: { id: 42 },
+      select: { is_admin: true, is_active_db: true },
     });
   });
 
-  it("requireAdminSession returns 403 for non-admin users", async () => {
-    const session = { user: { email: "user@example.com" } };
+  it("requireAdminSession returns 403 when a cached admin has been demoted", async () => {
+    const session = {
+      role: "admin",
+      is_admin: true,
+      user: { id: "42", email: "user@example.com", role: "admin", is_admin: true },
+    };
     const { requireAdminSession } = await loadApiAuth({
-      dbUser: { is_admin: false },
+      dbUser: { is_admin: false, is_active_db: true },
       session,
     });
 
@@ -109,6 +143,21 @@ describe("api auth guards", () => {
     await expect(readJson(result.response!)).resolves.toEqual({
       error: "Admin access required",
     });
+  });
+
+  it("requireAdminSession returns 401 for a deleted or inactive admin", async () => {
+    const session = { role: "admin", user: { id: "42", email: "admin@example.com" } };
+
+    const deleted = await loadApiAuth({ dbUser: null, session });
+    const deletedResult = await deleted.requireAdminSession();
+    expect(deletedResult.response?.status).toBe(401);
+
+    const inactive = await loadApiAuth({
+      dbUser: { is_admin: true, is_active_db: false },
+      session,
+    });
+    const inactiveResult = await inactive.requireAdminSession();
+    expect(inactiveResult.response?.status).toBe(401);
   });
 
   it("requireCronSecret accepts the configured bearer token", async () => {

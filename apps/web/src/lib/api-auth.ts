@@ -21,6 +21,14 @@ type AuthResult =
   | { session: SessionWithRole; response?: never }
   | { session?: never; response: NextResponse };
 
+type UserSessionResult =
+  | { session: SessionWithRole; userId: number; response?: never }
+  | { session?: never; userId?: never; response: NextResponse };
+
+type EmailSessionResult =
+  | { session: SessionWithRole; email: string; userId: number; response?: never }
+  | { session?: never; email?: never; userId?: never; response: NextResponse };
+
 export function unauthorized(message = "Unauthorized") {
   return NextResponse.json({ error: message }, { status: 401 });
 }
@@ -39,33 +47,48 @@ export async function requireSession(): Promise<AuthResult> {
   return { session };
 }
 
-export async function requireAdminSession(): Promise<AuthResult> {
+export async function requireUserSession(): Promise<UserSessionResult> {
   const auth = await requireSession();
-  if (auth.response) return auth;
+  if (auth.response) return { response: auth.response };
 
-  const session = auth.session;
-  const sessionIsAdmin =
-    session.is_admin === true ||
-    session.role === "admin" ||
-    session.user.is_admin === true ||
-    session.user.role === "admin";
-
-  if (sessionIsAdmin) {
-    return { session };
+  const userId = Number(auth.session.user.id);
+  if (!Number.isSafeInteger(userId) || userId <= 0) {
+    return { response: unauthorized() };
   }
 
-  if (session.user.email) {
-    const user = await esgPrisma.users.findUnique({
-      where: { email: session.user.email },
-      select: { is_admin: true },
-    });
+  return { session: auth.session, userId };
+}
 
-    if (user?.is_admin) {
-      return { session };
-    }
+export async function requireEmailSession(): Promise<EmailSessionResult> {
+  const auth = await requireUserSession();
+  if (auth.response) return { response: auth.response };
+
+  const email = auth.session.user.email?.trim();
+  if (!email) {
+    return { response: unauthorized() };
   }
 
-  return { response: forbidden("Admin access required") };
+  return { session: auth.session, email, userId: auth.userId };
+}
+
+export async function requireAdminSession(): Promise<AuthResult> {
+  const auth = await requireUserSession();
+  if (auth.response) return { response: auth.response };
+
+  const user = await esgPrisma.users.findUnique({
+    where: { id: auth.userId },
+    select: { is_admin: true, is_active_db: true },
+  });
+
+  if (!user || !user.is_active_db) {
+    return { response: unauthorized() };
+  }
+
+  if (user.is_admin !== true) {
+    return { response: forbidden("Admin access required") };
+  }
+
+  return { session: auth.session };
 }
 
 export function requireCronSecret(request: Request): NextResponse | null {

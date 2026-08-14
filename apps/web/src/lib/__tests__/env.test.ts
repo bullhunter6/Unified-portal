@@ -40,6 +40,18 @@ describe("env config", () => {
     ).toBe("sender@example.com");
   });
 
+  it("preserves weekly ESG events digest delivery settings for the server", () => {
+    expect(
+      loadEnv({
+        ESG_EVENTS_DIGEST_ENABLED: "true",
+        ESG_EVENTS_DIGEST_TEST_RECIPIENT: "test@example.com",
+      }),
+    ).toMatchObject({
+      ESG_EVENTS_DIGEST_ENABLED: "true",
+      ESG_EVENTS_DIGEST_TEST_RECIPIENT: "test@example.com",
+    });
+  });
+
   it("trims OLLAMA host/model before applying defaults", () => {
     expect(loadEnv({ OLLAMA_HOST: "   ", OLLAMA_MODEL: " custom-model " })).toMatchObject({
       OLLAMA_HOST: "https://ollama.com",

@@ -1,14 +1,9 @@
-/**
- * Email Alert System Library
- * Handles email queue processing and sending
- */
-
 import { esgPrisma } from "@esgcredit/db-esg";
 import { env } from "@/lib/config/env";
 
 export type EmailQueueItem = {
   id: number;
-  user_id: number;
+  user_id: number | null;
   email_to: string;
   email_subject: string;
   email_body: string;
@@ -26,290 +21,373 @@ export type EmailQueueItem = {
   updated_at: Date;
   alert_type: string | null;
   domain: string | null;
-  metadata: any;
+  metadata: unknown;
+  alert_history_id: number | null;
+  lease_expires_at: Date | null;
+  heartbeat_at: Date | null;
+  provider_message_id: string | null;
+  idempotency_key: string;
 };
 
-/**
- * Get emails ready to be sent from the queue
- */
-export async function getEmailsToSend(limit = 10): Promise<EmailQueueItem[]> {
-  const emails = await esgPrisma.$queryRaw<EmailQueueItem[]>`
-    SELECT * FROM email_queue
-    WHERE status = 'queued'
-      AND scheduled_for <= NOW()
-      AND attempts < max_attempts
-    ORDER BY priority DESC, scheduled_for ASC
-    LIMIT ${limit}
-  `;
-  return emails;
-}
+export type EnqueueEmailResult = {
+  queueId: number | null;
+  historyId: number;
+  deduplicated: boolean;
+};
 
-/**
- * Mark email as processing
- */
-export async function markEmailAsProcessing(
-  emailId: number,
-  workerId: string
-): Promise<void> {
-  await esgPrisma.$queryRaw`
-    UPDATE email_queue
-    SET status = 'processing',
-        processed_by = ${workerId},
-        updated_at = NOW()
-    WHERE id = ${emailId}
-  `;
-}
+export async function enqueueEmailWithHistory(args: {
+  userId: number | null;
+  to: string;
+  subject: string;
+  text: string;
+  html?: string;
+  domain: string;
+  alertType: string;
+  contentType?: string;
+  contentIds?: number[];
+  totalItems?: number;
+  priority?: number;
+  metadata?: unknown;
+  /** Stable logical-delivery identifier. Reusing it never queues a second email. */
+  deliveryKey?: string;
+  templateVersion?: string;
+  jobId?: string;
+}): Promise<EnqueueEmailResult> {
+  if (args.userId !== null && (!Number.isSafeInteger(args.userId) || args.userId <= 0)) {
+    throw new RangeError("userId must be a positive integer or null");
+  }
 
-/**
- * Mark email as sent successfully
- */
-export async function markEmailAsSent(emailId: number): Promise<void> {
-  await esgPrisma.$queryRaw`
-    UPDATE email_queue
-    SET status = 'sent',
-        sent_at = NOW(),
-        updated_at = NOW()
-    WHERE id = ${emailId}
-  `;
+  const deliveryKey = boundedOptionalValue(args.deliveryKey, 180, "deliveryKey");
+  const templateVersion = boundedOptionalValue(args.templateVersion, 10, "templateVersion");
+  const jobId = boundedOptionalValue(args.jobId, 100, "jobId");
+  const contentIds = args.contentIds ?? [];
+  const metadataJson = serializeMetadata(args.metadata);
 
-  // Update alert_history if exists
-  await esgPrisma.$queryRaw`
-    UPDATE alert_history
-    SET email_status = 'sent',
-        sent_at = NOW()
-    WHERE email_subject = (
-      SELECT email_subject FROM email_queue WHERE id = ${emailId}
-    )
-    AND email_status = 'pending'
-  `;
-}
-
-/**
- * Mark email as failed with error message
- */
-export async function markEmailAsFailed(
-  emailId: number,
-  errorMessage: string
-): Promise<void> {
-  await esgPrisma.$queryRaw`
-    UPDATE email_queue
-    SET status = 'failed',
-        last_error = ${errorMessage},
-        last_attempt_at = NOW(),
-        attempts = attempts + 1,
-        updated_at = NOW()
-    WHERE id = ${emailId}
-  `;
-
-  // Check if max attempts reached
-  const [email] = await esgPrisma.$queryRaw<EmailQueueItem[]>`
-    SELECT * FROM email_queue WHERE id = ${emailId}
-  `;
-
-  if (email && email.attempts >= email.max_attempts) {
-    // Update alert_history as permanently failed
-    await esgPrisma.$queryRaw`
-      UPDATE alert_history
-      SET email_status = 'failed',
-          error_message = ${errorMessage},
-          retry_count = ${email.attempts}
-      WHERE email_subject = ${email.email_subject}
-        AND email_status = 'pending'
+  return esgPrisma.$transaction(async (transaction) => {
+    const insertedHistory = await transaction.$queryRaw<Array<{ id: number }>>`
+      INSERT INTO alert_history (
+        user_id, domain, alert_type, content_type, content_ids, email_to,
+        email_subject, email_status, total_items, template_version, job_id,
+        delivery_key
+      ) VALUES (
+        ${args.userId}::integer,
+        ${args.domain},
+        ${args.alertType},
+        ${args.contentType ?? null}::varchar,
+        ${contentIds}::integer[],
+        ${args.to},
+        ${args.subject},
+        'pending',
+        ${args.totalItems ?? contentIds.length}::integer,
+        ${templateVersion}::varchar,
+        ${jobId}::varchar,
+        ${deliveryKey}::varchar
+      )
+      ON CONFLICT DO NOTHING
+      RETURNING id
     `;
-  }
+
+    const history = insertedHistory[0];
+    if (history) {
+      const insertedQueue = await transaction.$queryRaw<Array<{ id: number }>>`
+        INSERT INTO email_queue (
+          user_id, email_to, email_subject, email_body, email_html, priority,
+          scheduled_for, status, alert_type, domain, metadata, alert_history_id
+        ) VALUES (
+          ${args.userId}::integer,
+          ${args.to},
+          ${args.subject},
+          ${args.text},
+          ${args.html ?? null}::text,
+          ${args.priority ?? 5}::integer,
+          now(),
+          'queued',
+          ${args.alertType}::varchar,
+          ${args.domain}::varchar,
+          ${metadataJson}::jsonb,
+          ${history.id}::integer
+        )
+        RETURNING id
+      `;
+      const queue = insertedQueue[0];
+      if (!queue) throw new Error("Email queue insert did not return a row");
+      return {
+        queueId: queue.id,
+        historyId: history.id,
+        deduplicated: false,
+      };
+    }
+
+    // The only caller-controlled conflict is the optional unique delivery key.
+    // Looking up the committed winner makes concurrent scheduler replicas safe.
+    if (!deliveryKey) {
+      throw new Error("Email history insert conflicted without a delivery key");
+    }
+    const existingHistory = await transaction.$queryRaw<Array<{ id: number }>>`
+      SELECT id
+      FROM alert_history
+      WHERE delivery_key = ${deliveryKey}
+      LIMIT 1
+    `;
+    const existing = existingHistory[0];
+    if (!existing) throw new Error("Deduplicated email history could not be loaded");
+    const existingQueue = await transaction.$queryRaw<Array<{ id: number }>>`
+      SELECT id
+      FROM email_queue
+      WHERE alert_history_id = ${existing.id}::integer
+      LIMIT 1
+    `;
+    return {
+      queueId: existingQueue[0]?.id ?? null,
+      historyId: existing.id,
+      deduplicated: true,
+    };
+  });
 }
 
-/**
- * Retry failed email (requeue it)
- */
-export async function requeueEmail(emailId: number): Promise<void> {
-  await esgPrisma.$queryRaw`
-    UPDATE email_queue
-    SET status = 'queued',
-        scheduled_for = NOW() + INTERVAL '5 minutes',
-        updated_at = NOW()
-    WHERE id = ${emailId}
-      AND attempts < max_attempts
+function boundedOptionalValue(
+  value: string | undefined,
+  maximumLength: number,
+  field: string,
+): string | null {
+  if (value === undefined) return null;
+  const normalized = value.trim();
+  if (!normalized || normalized.length > maximumLength) {
+    throw new RangeError(`${field} must contain 1-${maximumLength} characters`);
+  }
+  return normalized;
+}
+
+function serializeMetadata(metadata: unknown): string | null {
+  if (metadata === undefined) return null;
+  const serialized = JSON.stringify(metadata);
+  if (serialized === undefined) {
+    throw new TypeError("metadata must be JSON serializable");
+  }
+  return serialized;
+}
+
+/** Atomically claims queued work and expired leases across all worker replicas. */
+export async function claimEmailsToSend(
+  workerId: string,
+  limit = 10,
+  leaseSeconds = 300,
+): Promise<EmailQueueItem[]> {
+  const safeLimit = Math.max(1, Math.min(limit, 100));
+  const safeLease = Math.max(60, Math.min(leaseSeconds, 900));
+  await esgPrisma.$executeRaw`
+    WITH exhausted AS (
+      UPDATE email_queue
+      SET status = 'failed', lease_expires_at = NULL,
+          last_error = COALESCE(last_error, 'Worker lease expired after final attempt'),
+          updated_at = now()
+      WHERE status = 'processing'
+        AND COALESCE(attempts, 0) >= COALESCE(max_attempts, 3)
+        AND (lease_expires_at IS NULL OR lease_expires_at < now())
+      RETURNING alert_history_id, attempts, last_error
+    )
+    UPDATE alert_history
+    SET email_status = 'failed', error_message = exhausted.last_error,
+        retry_count = exhausted.attempts
+    FROM exhausted
+    WHERE alert_history.id = exhausted.alert_history_id
+  `;
+  return esgPrisma.$queryRaw<EmailQueueItem[]>`
+    WITH candidates AS (
+      SELECT id
+      FROM email_queue
+      WHERE (
+        (status = 'queued' AND scheduled_for <= now())
+        OR (status = 'processing' AND (lease_expires_at IS NULL OR lease_expires_at < now()))
+      )
+        AND COALESCE(attempts, 0) < COALESCE(max_attempts, 3)
+      ORDER BY priority DESC, scheduled_for ASC
+      FOR UPDATE SKIP LOCKED
+      LIMIT ${safeLimit}
+    )
+    UPDATE email_queue AS email
+    SET status = 'processing',
+        attempts = COALESCE(email.attempts, 0) + 1,
+        processed_by = ${workerId},
+        lease_expires_at = now() + (${safeLease} * INTERVAL '1 second'),
+        heartbeat_at = now(),
+        last_attempt_at = now(),
+        updated_at = now()
+    FROM candidates
+    WHERE email.id = candidates.id
+    RETURNING email.*
   `;
 }
 
-/**
- * Send email using Gmail SMTP via Nodemailer
- * FREE & UNLIMITED (within Gmail's 500 emails/day limit)
- * Works with all email providers including Outlook/Gmail/Yahoo
- * 
- * Setup:
- * 1. Add to .env file:
- *    MAIL_SERVER=smtp.gmail.com
- *    MAIL_PORT=587
- *    MAIL_USERNAME=alerts@example.com
- *    MAIL_PASSWORD=<app-password>
- *    MAIL_FROM=alerts@example.com
- * 2. Install nodemailer: npm install nodemailer
- * 3. Done! No API keys or signups needed
- */
-export async function sendEmail(email: EmailQueueItem): Promise<boolean> {
-  try {
-    // Check if SMTP is configured
-    if (!env.MAIL_USERNAME || !env.MAIL_PASSWORD) {
-      console.warn("⚠️  Gmail SMTP not configured - email not sent");
-      console.log(`📧 Would send to: ${email.email_to}`);
-      console.log(`Subject: ${email.email_subject}`);
-      
-      // In development without credentials, just log and pretend it worked
-      if (process.env.NODE_ENV === "development") {
-        return true;
-      }
-      return false;
-    }
-
-    // Import nodemailer dynamically
-    const nodemailer = await import("nodemailer");
-
-    // Create reusable transporter using Gmail SMTP
-    const transporter = nodemailer.default.createTransport({
-      host: env.MAIL_SERVER,
-      port: parseInt(env.MAIL_PORT),
-      secure: false, // true for 465, false for other ports
-      auth: {
-        user: env.MAIL_USERNAME,
-        pass: env.MAIL_PASSWORD,
-      },
-    });
-
-    // Send email
-    const info = await transporter.sendMail({
-      from: env.MAIL_FROM, // sender address
-      to: email.email_to, // recipient
-      subject: email.email_subject,
-      text: email.email_body, // plain text body
-      html: email.email_html || email.email_body, // HTML body
-    });
-
-    console.log(`✅ Email sent successfully via Gmail - Message ID: ${info.messageId}`);
-    return true;
-
-  } catch (error: any) {
-    console.error("❌ Failed to send email via Gmail SMTP:", error);
-    
-    // Log specific error details for debugging
-    if (error.message) {
-      console.error("Error message:", error.message);
-    }
-    if (error.code) {
-      console.error("Error code:", error.code);
-    }
-    
-    return false;
-  }
+export async function heartbeatEmail(
+  emailId: number,
+  workerId: string,
+  leaseSeconds = 300,
+): Promise<boolean> {
+  const safeLease = Math.max(60, Math.min(leaseSeconds, 900));
+  const changed = await esgPrisma.$executeRaw`
+    UPDATE email_queue
+    SET heartbeat_at = now(),
+        lease_expires_at = now() + (${safeLease} * INTERVAL '1 second'),
+        updated_at = now()
+    WHERE id = ${emailId} AND status = 'processing' AND processed_by = ${workerId}
+  `;
+  return changed > 0;
 }
 
-/**
- * Process email queue - main worker function
- */
-export async function processEmailQueue(
-  workerId = "worker-1",
-  batchSize = 10
-): Promise<{
-  processed: number;
-  sent: number;
-  failed: number;
-}> {
-  const stats = { processed: 0, sent: 0, failed: 0 };
+export async function markEmailAsSent(
+  emailId: number,
+  workerId: string,
+  providerMessageId: string,
+): Promise<boolean> {
+  const rows = await esgPrisma.$queryRaw<Array<{ id: number }>>`
+    WITH sent AS (
+      UPDATE email_queue
+      SET status = 'sent', sent_at = now(), provider_message_id = ${providerMessageId},
+          last_error = NULL, lease_expires_at = NULL, heartbeat_at = now(),
+          updated_at = now()
+      WHERE id = ${emailId} AND status = 'processing' AND processed_by = ${workerId}
+      RETURNING id, alert_history_id, attempts
+    ), history AS (
+      UPDATE alert_history
+      SET email_status = 'sent', sent_at = now(), error_message = NULL,
+          retry_count = sent.attempts
+      FROM sent
+      WHERE alert_history.id = sent.alert_history_id
+      RETURNING alert_history.id
+    )
+    SELECT id FROM sent
+  `;
+  return rows.length > 0;
+}
 
-  try {
-    // Get emails to send
-    const emails = await getEmailsToSend(batchSize);
+export async function markEmailAsFailed(
+  email: EmailQueueItem,
+  workerId: string,
+  errorMessage: string,
+): Promise<"queued" | "failed"> {
+  const retry = email.attempts < email.max_attempts;
+  const delaySeconds = Math.min(3600, 60 * 2 ** Math.max(0, email.attempts - 1));
+  const status = retry ? "queued" : "failed";
+  await esgPrisma.$executeRaw`
+    WITH failed AS (
+      UPDATE email_queue
+      SET status = ${status},
+          last_error = ${errorMessage.slice(0, 10_000)},
+          scheduled_for = CASE
+            WHEN ${retry} THEN now() + (${delaySeconds} * INTERVAL '1 second')
+            ELSE scheduled_for
+          END,
+          lease_expires_at = NULL,
+          updated_at = now()
+      WHERE id = ${email.id} AND status = 'processing' AND processed_by = ${workerId}
+      RETURNING alert_history_id, attempts
+    )
+    UPDATE alert_history
+    SET email_status = 'failed', error_message = ${errorMessage.slice(0, 10_000)},
+        retry_count = failed.attempts
+    FROM failed
+    WHERE ${!retry} AND alert_history.id = failed.alert_history_id
+  `;
+  return status;
+}
 
-    if (emails.length === 0) {
-      console.log("📭 No emails in queue to process");
-      return stats;
+export async function sendEmail(email: EmailQueueItem): Promise<string> {
+  if (!env.MAIL_USERNAME || !env.MAIL_PASSWORD) {
+    if (process.env.NODE_ENV === "development" || process.env.NODE_ENV === "test") {
+      return `<portal-email-${email.id}-${email.idempotency_key}@local.invalid>`;
     }
-
-    console.log(`📬 Processing ${emails.length} emails from queue...`);
-
-    for (const email of emails) {
-      stats.processed++;
-
-      try {
-        // Mark as processing
-        await markEmailAsProcessing(email.id, workerId);
-
-        // Send email
-        const success = await sendEmail(email);
-
-        if (success) {
-          await markEmailAsSent(email.id);
-          stats.sent++;
-          console.log(`✅ Email ${email.id} sent successfully`);
-        } else {
-          throw new Error("Email sending failed");
-        }
-      } catch (error: any) {
-        await markEmailAsFailed(email.id, error.message || "Unknown error");
-        stats.failed++;
-        console.error(`❌ Email ${email.id} failed:`, error.message);
-
-        // Requeue if not at max attempts
-        if (email.attempts + 1 < email.max_attempts) {
-          await requeueEmail(email.id);
-          console.log(`🔄 Email ${email.id} requeued for retry`);
-        }
-      }
-    }
-
-    console.log(
-      `📊 Queue processing complete: ${stats.sent} sent, ${stats.failed} failed`
-    );
-  } catch (error) {
-    console.error("❌ Error processing email queue:", error);
+    throw new Error("SMTP is not configured");
   }
 
+  const nodemailer = await import("nodemailer");
+  const transporter = nodemailer.default.createTransport({
+    host: env.MAIL_SERVER,
+    port: Number.parseInt(env.MAIL_PORT, 10),
+    secure: Number.parseInt(env.MAIL_PORT, 10) === 465,
+    connectionTimeout: 30_000,
+    greetingTimeout: 15_000,
+    socketTimeout: 30_000,
+    auth: { user: env.MAIL_USERNAME, pass: env.MAIL_PASSWORD },
+  });
+  const mailFrom = env.MAIL_FROM || env.MAIL_USERNAME;
+  const stableMessageId = `<portal-email-${email.id}-${email.idempotency_key}@${emailDomain(mailFrom)}>`;
+  const info = await transporter.sendMail({
+    messageId: stableMessageId,
+    from: mailFrom,
+    to: email.email_to,
+    subject: email.email_subject,
+    text: email.email_body,
+    html: email.email_html || email.email_body,
+  });
+  return info.messageId || stableMessageId;
+}
+
+export async function processEmailQueue(
+  workerId = "email-worker",
+  batchSize = 10,
+): Promise<{ processed: number; sent: number; failed: number }> {
+  const stats = { processed: 0, sent: 0, failed: 0 };
+  const emails = await claimEmailsToSend(workerId, batchSize);
+
+  for (const email of emails) {
+    stats.processed += 1;
+    try {
+      await heartbeatEmail(email.id, workerId);
+      const messageId = await sendEmail(email);
+      if (!(await markEmailAsSent(email.id, workerId, messageId))) {
+        throw new Error("Email lease was lost before completion");
+      }
+      stats.sent += 1;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown email error";
+      await markEmailAsFailed(email, workerId, message);
+      stats.failed += 1;
+    }
+  }
   return stats;
 }
 
-/**
- * Clean up old processed emails from queue
- */
 export async function cleanupEmailQueue(olderThanDays = 30): Promise<number> {
-  const result = await esgPrisma.$queryRaw<{ count: bigint }[]>`
+  const safeDays = Math.max(1, Math.min(olderThanDays, 365));
+  const result = await esgPrisma.$queryRaw<Array<{ count: number }>>`
     WITH deleted AS (
       DELETE FROM email_queue
       WHERE status IN ('sent', 'failed')
-        AND updated_at < NOW() - INTERVAL '${olderThanDays} days'
-      RETURNING *
+        AND updated_at < now() - (${safeDays} * INTERVAL '1 day')
+      RETURNING id
     )
     SELECT COUNT(*)::int AS count FROM deleted
   `;
-
-  const count = Number(result[0]?.count || 0);
-  console.log(`🧹 Cleaned up ${count} old emails from queue`);
-  return count;
+  return Number(result[0]?.count ?? 0);
 }
 
-/**
- * Get queue statistics
- */
 export async function getQueueStats() {
   const [stats] = await esgPrisma.$queryRaw<any[]>`
-    SELECT 
+    SELECT
       COUNT(*)::int AS total,
-      COUNT(CASE WHEN status = 'queued' THEN 1 END)::int AS queued,
-      COUNT(CASE WHEN status = 'processing' THEN 1 END)::int AS processing,
-      COUNT(CASE WHEN status = 'sent' THEN 1 END)::int AS sent,
-      COUNT(CASE WHEN status = 'failed' THEN 1 END)::int AS failed,
-      COUNT(CASE WHEN status = 'cancelled' THEN 1 END)::int AS cancelled,
-      MIN(CASE WHEN status = 'queued' THEN scheduled_for END) AS next_scheduled
+      COUNT(*) FILTER (WHERE status = 'queued')::int AS queued,
+      COUNT(*) FILTER (WHERE status = 'processing')::int AS processing,
+      COUNT(*) FILTER (WHERE status = 'sent')::int AS sent,
+      COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
+      COUNT(*) FILTER (WHERE status = 'cancelled')::int AS cancelled,
+      COUNT(*) FILTER (WHERE status = 'processing' AND lease_expires_at < now())::int AS stale,
+      MIN(scheduled_for) FILTER (WHERE status = 'queued') AS next_scheduled
     FROM email_queue
   `;
-
-  return stats || {
+  return stats ?? {
     total: 0,
     queued: 0,
     processing: 0,
     sent: 0,
     failed: 0,
     cancelled: 0,
+    stale: 0,
     next_scheduled: null,
   };
+}
+
+function emailDomain(from: string): string {
+  const domain = from.split("@").pop()?.replace(/[^a-z0-9.-]/gi, "");
+  return domain || "portal.local";
 }

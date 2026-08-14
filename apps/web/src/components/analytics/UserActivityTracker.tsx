@@ -2,6 +2,7 @@
 "use client";
 
 import { usePathname, useSearchParams } from "next/navigation";
+import { useSession } from "next-auth/react";
 import { useEffect, useRef } from "react";
 
 type TrackActivityProps = {
@@ -39,10 +40,11 @@ export function TrackActivity({
     details,
     delayMs = 700,
 }: TrackActivityProps) {
+    const { status } = useSession();
     const hasTrackedRef = useRef(false);
 
     useEffect(() => {
-        if (hasTrackedRef.current) {
+        if (status !== "authenticated" || hasTrackedRef.current) {
             return;
         }
 
@@ -58,17 +60,20 @@ export function TrackActivity({
         }, delayMs);
 
         return () => window.clearTimeout(timeoutId);
-    }, [action, delayMs, details, resourceId, resourceType]);
+    }, [action, delayMs, details, resourceId, resourceType, status]);
 
     return null;
 }
 
 export function UserActivityTracker() {
+    const { status } = useSession();
     const pathname = usePathname();
     const searchParams = useSearchParams();
     const lastPathRef = useRef<string | null>(null);
 
     useEffect(() => {
+        if (status !== "authenticated") return;
+
         // Construct full URL including search params for better context
         const url = pathname + (searchParams?.toString() ? `?${searchParams.toString()}` : "");
 
@@ -87,7 +92,7 @@ export function UserActivityTracker() {
         }, 500);
 
         return () => clearTimeout(timeoutId);
-    }, [pathname, searchParams]);
+    }, [pathname, searchParams, status]);
 
     return null;
 }

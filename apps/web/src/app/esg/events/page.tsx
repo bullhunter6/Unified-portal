@@ -1,236 +1,247 @@
-// src/app/esg/events/page.tsx
-import { listEvents, getEventSources, eventRowToListItem } from "@/lib/events";
-import EventCard from "@/components/events/EventCard";
-import EventsFilterBar from "@/components/events/EventsFilterBar";
-import EventsPaginator from "@/components/events/EventsPaginator";
-import EmptyResult from "@/components/ui/empty-result";
-import { Calendar, TrendingUp, CalendarDays, Clock, Zap } from "lucide-react";
+import {
+  AppliedFilters,
+  EventAgenda,
+  EventFilters,
+  EventPaginator,
+  LedgerEmptyState,
+  LedgerHero,
+  TimeRail,
+} from "@/components/esg-events";
+import type {
+  EsgAppliedFilter,
+  EsgCountryChoice,
+  EsgPageLink,
+  EsgTimeOption,
+} from "@/components/esg-events/types";
+import {
+  createEsgRequestClock,
+  parseEsgEventSearchParams,
+  type EsgEventFilters,
+} from "@/lib/esg-events";
+import { listEsgEvents } from "@/lib/esg-events/repository";
+import { buildEsgEventsUrl, updateEsgEventFilters } from "@/lib/esg-events/urls";
+import { redirect } from "next/navigation";
+import {
+  formatMonthLabel,
+  toAgendaEvent,
+} from "./_presentation";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
-export default async function EventsPage({
+type EventSearchParams = Record<string, string | string[] | undefined>;
+type DiscoveryFilter = "q" | "country" | "city" | "format" | "source";
+
+function urlWithoutFilter(filters: EsgEventFilters, key: DiscoveryFilter): string {
+  const next = { ...filters, page: 1 };
+  delete next[key];
+  if (key === "country") delete next.city;
+  return buildEsgEventsUrl(next);
+}
+
+function urlForPage(filters: EsgEventFilters, page: number): string {
+  return buildEsgEventsUrl({ ...filters, page });
+}
+
+function pageLinks(filters: EsgEventFilters, totalPages: number): EsgPageLink[] {
+  const pages = new Set([1, totalPages]);
+  for (let page = Math.max(1, filters.page - 2); page <= Math.min(totalPages, filters.page + 2); page += 1) {
+    pages.add(page);
+  }
+  return Array.from(pages)
+    .sort((a, b) => a - b)
+    .map((page) => ({ page, href: urlForPage(filters, page) }));
+}
+
+function timeOption(
+  filters: EsgEventFilters,
+  value: EsgEventFilters["when"],
+  label: string,
+  count?: number,
+): EsgTimeOption {
+  return {
+    value,
+    label,
+    href: buildEsgEventsUrl(updateEsgEventFilters(filters, { when: value })),
+    description: typeof count === "number" ? `${count.toLocaleString("en")} events` : undefined,
+  };
+}
+
+function headingForWhen(when: EsgEventFilters["when"]): string {
+  switch (when) {
+    case "upcoming":
+      return "Upcoming events";
+    case "week":
+      return "This week";
+    case "past":
+      return "Past events";
+    case "tbc":
+      return "Dates to be confirmed";
+    case "all":
+      return "All events";
+    default:
+      return formatMonthLabel(when);
+  }
+}
+
+export default async function EsgEventsPage({
   searchParams,
 }: {
-  searchParams: Promise<{ page?: string; pageSize?: string; view?: string; q?: string; source?: string; dateRange?: string }>;
+  searchParams: Promise<EventSearchParams>;
 }) {
-  const resolvedSearchParams = await searchParams;
-  const domain = "esg";
-  const page = Math.max(1, Number(resolvedSearchParams.page ?? "1"));
-  const pageSize = Math.min(50, Math.max(5, Number(resolvedSearchParams.pageSize ?? "20")));
-  const viewMode = resolvedSearchParams.view || "grid";
-  const searchQuery = resolvedSearchParams.q?.trim() || undefined;
-  const sourceFilter = resolvedSearchParams.source?.trim() || undefined;
-  const dateRangeFilter = resolvedSearchParams.dateRange?.trim() || undefined;
+  const rawSearchParams = await searchParams;
+  const requestClock = createEsgRequestClock(new Date());
+  const parsed = parseEsgEventSearchParams(rawSearchParams, { now: requestClock.now });
 
-  const sources = await getEventSources(domain);
-  const { rows, total } = await listEvents({
-    domain,
-    page,
-    pageSize,
-    q: searchQuery,
-    source: sourceFilter,
-    dateRange: dateRangeFilter,
-  });
+  if (parsed.needsRedirect) {
+    redirect(parsed.canonicalSearch ? `/esg/events?${parsed.canonicalSearch}` : "/esg/events");
+  }
 
-  const events = rows.map(eventRowToListItem);
-  const serializedEvents = JSON.parse(JSON.stringify(events));
-  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const result = await listEsgEvents(parsed.filters, requestClock);
+  if (parsed.filters.page > result.totalPages) {
+    redirect(urlForPage(parsed.filters, result.totalPages));
+  }
 
-  // Categorize events
-  const now = new Date();
-  const categorizedEvents = {
-    happening: serializedEvents.filter((e: any) => {
-      if (e.date) {
-        const eventDate = new Date(e.date);
-        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-        const eventDay = new Date(eventDate.getFullYear(), eventDate.getMonth(), eventDate.getDate());
-        return eventDay.getTime() === today.getTime();
-      }
-      const start = e.start_date ? new Date(e.start_date) : null;
-      const end = e.end_date ? new Date(e.end_date) : null;
-      if (start && end) return start <= now && end >= now;
-      if (start) {
-        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-        const eventDay = new Date(start.getFullYear(), start.getMonth(), start.getDate());
-        return eventDay.getTime() === today.getTime();
-      }
-      return false;
-    }),
-    upcoming: serializedEvents.filter((e: any) => {
-      if (e.date) {
-        const eventDate = new Date(e.date);
-        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-        const eventDay = new Date(eventDate.getFullYear(), eventDate.getMonth(), eventDate.getDate());
-        return eventDay > today;
-      }
-      const start = e.start_date ? new Date(e.start_date) : null;
-      if (start) return start > now;
-      return true;
-    }),
-    past: serializedEvents.filter((e: any) => {
-      if (e.date) {
-        const eventDate = new Date(e.date);
-        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-        const eventDay = new Date(eventDate.getFullYear(), eventDate.getMonth(), eventDate.getDate());
-        return eventDay < today;
-      }
-      const end = e.end_date ? new Date(e.end_date) : null;
-      if (end) return end < now;
-      return false;
-    }),
-  };
+  const filters = parsed.filters;
+  const quickCounts = new Map(result.facets.time.map((facet) => [facet.value, facet.count]));
+  const forwardMonths = result.facets.months
+    .filter((month) => month.value >= requestClock.currentMonth)
+    .slice(0, 3);
+  const selectedMonth = /^\d{4}-\d{2}$/.test(filters.when)
+    ? result.facets.months.find((month) => month.value === filters.when)
+    : undefined;
+  const railMonths = selectedMonth && !forwardMonths.some((month) => month.value === selectedMonth.value)
+    ? [selectedMonth, ...forwardMonths]
+    : forwardMonths;
+  const quickOptions: EsgTimeOption[] = [
+    timeOption(filters, "upcoming", "Upcoming", quickCounts.get("upcoming")),
+    timeOption(filters, "week", "This week", quickCounts.get("week")),
+    ...railMonths.map((month) => timeOption(filters, month.value as EsgEventFilters["when"], month.label, month.count)),
+    timeOption(filters, "past", "Past", quickCounts.get("past")),
+    timeOption(filters, "tbc", "Date TBC", quickCounts.get("tbc")),
+    timeOption(filters, "all", "All", quickCounts.get("all")),
+  ];
+  const monthOptions = result.facets.months.map((month) => ({
+    ...timeOption(filters, month.value as EsgEventFilters["when"], month.label, month.count),
+    group: "month" as const,
+  }));
+
+  const countries: EsgCountryChoice[] = result.facets.countries.map((country) => ({
+    ...country,
+    cities: (result.facets.citiesByCountry[country.value] ?? []).map((city) => ({ ...city })),
+  }));
+  const activeFilterCount = (["q", "country", "city", "format", "source"] as const)
+    .filter((key) => Boolean(filters[key])).length;
+  const clearFilters: EsgEventFilters = { when: filters.when, page: 1 };
+  const clearHref = buildEsgEventsUrl(clearFilters);
+
+  const appliedFilters: EsgAppliedFilter[] = [];
+  if (filters.q) {
+    appliedFilters.push({ key: "q", label: "Search", value: filters.q, removeHref: urlWithoutFilter(filters, "q") });
+  }
+  if (filters.country) {
+    const label = countries.find((country) => country.value === filters.country)?.label ?? filters.country;
+    appliedFilters.push({ key: "country", label: "Country", value: label, removeHref: urlWithoutFilter(filters, "country") });
+  }
+  if (filters.city) {
+    appliedFilters.push({ key: "city", label: "City", value: filters.city, removeHref: urlWithoutFilter(filters, "city") });
+  }
+  if (filters.format) {
+    const label = result.facets.formats.find((format) => format.value === filters.format)?.label ?? filters.format;
+    appliedFilters.push({ key: "format", label: "Attendance", value: label, removeHref: urlWithoutFilter(filters, "format") });
+  }
+  if (filters.source) {
+    appliedFilters.push({ key: "source", label: "Source", value: filters.source, removeHref: urlWithoutFilter(filters, "source") });
+  }
+
+  const allCount = quickCounts.get("all") ?? 0;
+  const emptyVariant = activeFilterCount > 0
+    ? "filtered"
+    : filters.when === "upcoming" && allCount > 0
+      ? "no-upcoming"
+      : filters.when === "tbc" && allCount > 0
+        ? "date-tbc"
+        : allCount === 0
+          ? "no-data"
+          : "filtered";
+  const allEventsHref = buildEsgEventsUrl({ ...filters, when: "all", page: 1 });
+  const agendaEvents = result.items.map((event) => toAgendaEvent(event, filters));
+  const rangeStart = result.total ? (filters.page - 1) * result.pageSize + 1 : 0;
+  const rangeEnd = Math.min(result.total, filters.page * result.pageSize);
+  const resultDescription = result.total
+    ? `Showing ${rangeStart.toLocaleString("en")}–${rangeEnd.toLocaleString("en")} of ${result.total.toLocaleString("en")}`
+    : "No matching entries";
 
   return (
-    <main className="min-h-screen bg-gradient-to-b from-[var(--surface)] to-[var(--background)]">
-      {/* Compact Hero */}
-      <div className="relative overflow-hidden bg-gradient-to-r from-emerald-900 via-teal-800 to-emerald-900">
-        <div className="absolute inset-0 bg-[url('/grid.svg')] opacity-10"></div>
-        <div className="absolute inset-0 bg-gradient-to-t from-black/20 to-transparent"></div>
-        
-        <div className="relative mx-auto max-w-[1400px] px-6 py-10">
-          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-6">
-            {/* Title Section */}
-            <div className="flex items-center gap-4">
-              <div className="p-3 rounded-2xl bg-white/10 backdrop-blur-sm">
-                <Calendar className="h-8 w-8 text-white" />
-              </div>
-              <div>
-                <h1 className="text-3xl font-bold text-white tracking-tight">
-                  ESG Events
-                </h1>
-                <p className="text-white/70 text-sm mt-1">
-                  Sustainability events & ESG conferences
-                </p>
-              </div>
-            </div>
+    <main className="min-h-screen overflow-x-clip bg-background text-foreground">
+      <LedgerHero
+        summary={{
+          upcoming: result.summary.upcoming,
+          thisMonth: result.summary.thisMonth,
+          countries: result.summary.representedCountries,
+        }}
+        asOfLabel={`As of ${new Intl.DateTimeFormat("en", {
+          timeZone: "Asia/Dubai",
+          day: "numeric",
+          month: "long",
+          year: "numeric",
+        }).format(requestClock.now)} · Dubai time`}
+      />
+      <TimeRail
+        options={quickOptions}
+        monthOptions={monthOptions}
+        currentValue={filters.when}
+        allMonthsHref={buildEsgEventsUrl(updateEsgEventFilters(filters, { when: "all" }))}
+      />
 
-            {/* Stats */}
-            <div className="flex items-center gap-3">
-              <div className="flex items-center gap-3 px-4 py-2.5 rounded-xl bg-white/10 backdrop-blur-sm">
-                <TrendingUp className="h-4 w-4 text-white/70" />
-                <div className="text-right">
-                  <div className="text-2xl font-bold text-white">{total}</div>
-                  <div className="text-[10px] uppercase tracking-wider text-white/50">Events</div>
-                </div>
-              </div>
-              
-              {categorizedEvents.happening.length > 0 && (
-                <div className="flex items-center gap-3 px-4 py-2.5 rounded-xl bg-green-500/20 backdrop-blur-sm border border-green-400/20">
-                  <div className="relative">
-                    <Zap className="h-4 w-4 text-green-400" />
-                    <span className="absolute -top-0.5 -right-0.5 h-2 w-2 bg-green-400 rounded-full animate-ping"></span>
-                  </div>
-                  <div className="text-right">
-                    <div className="text-2xl font-bold text-green-400">{categorizedEvents.happening.length}</div>
-                    <div className="text-[10px] uppercase tracking-wider text-green-400/70">Live</div>
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      </div>
+      <div className="mx-auto w-full max-w-7xl px-4 py-7 sm:px-6 sm:py-9 lg:px-8">
+        <AppliedFilters filters={appliedFilters} clearHref={clearHref} />
+        <div className="mt-5 flex min-w-0 flex-col gap-7 lg:flex-row lg:items-start lg:gap-9">
+          <EventFilters
+            state={{
+              q: filters.q ?? "",
+              country: filters.country ?? "",
+              city: filters.city ?? "",
+              format: filters.format ?? "",
+              source: filters.source ?? "",
+              when: filters.when,
+            }}
+            countries={countries}
+            formats={result.facets.formats.map((format) => ({ ...format }))}
+            sources={result.facets.sources.map((source) => ({ ...source }))}
+            activeFilterCount={activeFilterCount}
+            clearHref={clearHref}
+            resultCount={result.total}
+          />
 
-      {/* Main Content */}
-      <div className="mx-auto max-w-[1400px] px-6 py-6">
-        {/* Filter Bar */}
-        <EventsFilterBar sources={sources} domain={domain} />
-        
-        {serializedEvents.length === 0 ? (
-          <div className="mt-8">
-            <EmptyResult
-              title="No events found"
-              description="We couldn't find any events matching your criteria. Try adjusting your filters or check back later."
-            />
-          </div>
-        ) : (
-          <div className="mt-6 space-y-8">
-            {/* Live Events */}
-            {categorizedEvents.happening.length > 0 && (
-              <section>
-                <div className="flex items-center gap-3 mb-4">
-                  <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-green-500/10 border border-green-500/20">
-                    <span className="relative flex h-2 w-2">
-                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
-                      <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
-                    </span>
-                    <span className="text-sm font-semibold text-green-600 dark:text-green-400">Happening Now</span>
-                  </div>
-                </div>
-                <div className={viewMode === 'list' ? 'space-y-3' : 'grid gap-4 sm:grid-cols-2 lg:grid-cols-3'}>
-                  {categorizedEvents.happening.map((e: any) => (
-                    <EventCard 
-                      key={`happening-${e.id}`} 
-                      event={e}
-                      variant="live"
-                      viewMode={viewMode as 'grid' | 'list'}
-                    />
-                  ))}
-                </div>
-              </section>
-            )}
-
-            {/* Upcoming Events */}
-            {categorizedEvents.upcoming.length > 0 && (
-              <section>
-                <div className="flex items-center justify-between mb-4">
-                  <div className="flex items-center gap-2">
-                    <CalendarDays className="h-5 w-5 text-[var(--brand)]" />
-                    <h2 className="text-lg font-semibold text-[var(--text)]">Upcoming Events</h2>
-                  </div>
-                  <span className="text-sm text-[var(--text-muted)]">
-                    {categorizedEvents.upcoming.length} event{categorizedEvents.upcoming.length !== 1 ? 's' : ''}
-                  </span>
-                </div>
-                <div className={viewMode === 'list' ? 'space-y-3' : 'grid gap-4 sm:grid-cols-2 lg:grid-cols-3'}>
-                  {categorizedEvents.upcoming.map((e: any) => (
-                    <EventCard 
-                      key={`upcoming-${e.id}`} 
-                      event={e}
-                      variant="upcoming"
-                      viewMode={viewMode as 'grid' | 'list'}
-                    />
-                  ))}
-                </div>
-              </section>
-            )}
-
-            {/* Past Events */}
-            {categorizedEvents.past.length > 0 && (
-              <section className="opacity-70">
-                <div className="flex items-center justify-between mb-4">
-                  <div className="flex items-center gap-2">
-                    <Clock className="h-5 w-5 text-[var(--text-muted)]" />
-                    <h2 className="text-lg font-medium text-[var(--text-muted)]">Past Events</h2>
-                  </div>
-                  <span className="text-sm text-[var(--text-muted)]">
-                    {categorizedEvents.past.length} event{categorizedEvents.past.length !== 1 ? 's' : ''}
-                  </span>
-                </div>
-                <div className={viewMode === 'list' ? 'space-y-3' : 'grid gap-4 sm:grid-cols-2 lg:grid-cols-3'}>
-                  {categorizedEvents.past.map((e: any) => (
-                    <EventCard 
-                      key={`past-${e.id}`} 
-                      event={e}
-                      variant="past"
-                      viewMode={viewMode as 'grid' | 'list'}
-                    />
-                  ))}
-                </div>
-              </section>
-            )}
-
-            {/* Pagination */}
-            {totalPages > 1 && (
-              <EventsPaginator
-                page={page}
-                totalPages={totalPages}
-                pageSize={pageSize}
+          <div className="min-w-0 flex-1">
+            {agendaEvents.length ? (
+              <>
+                <EventAgenda
+                  events={agendaEvents}
+                  heading={headingForWhen(filters.when)}
+                  resultDescription={resultDescription}
+                />
+                <EventPaginator
+                  page={filters.page}
+                  totalPages={result.totalPages}
+                  total={result.total}
+                  rangeStart={rangeStart}
+                  rangeEnd={rangeEnd}
+                  previousHref={filters.page > 1 ? urlForPage(filters, filters.page - 1) : undefined}
+                  nextHref={filters.page < result.totalPages ? urlForPage(filters, filters.page + 1) : undefined}
+                  pageLinks={pageLinks(filters, result.totalPages)}
+                />
+              </>
+            ) : (
+              <LedgerEmptyState
+                variant={emptyVariant}
+                clearHref={activeFilterCount ? clearHref : undefined}
+                allEventsHref={allEventsHref}
               />
             )}
           </div>
-        )}
+        </div>
       </div>
     </main>
   );

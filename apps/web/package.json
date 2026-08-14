@@ -76,6 +76,7 @@
     "zod": "^4.1.12"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.12.1",
     "@eslint/eslintrc": "^3.3.5",
     "@playwright/test": "1.61.1",
     "@types/bcryptjs": "^3.0.0",
