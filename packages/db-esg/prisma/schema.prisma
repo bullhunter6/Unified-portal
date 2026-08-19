@@ -91,52 +91,55 @@ model likes {
   @@index([user_id], map: "ix_likes_user_id")
 }
 
-model pdf_translation_jobs {
-  id               String    @id @db.Uuid
+model pdf_translation_v2_jobs {
+  id               String                     @id @db.Uuid
   user_id          Int
   filename         String
-  stored_filename  String
-  input_path       String
-  target_lang      String    @default("English")
-  status           String    @default("processing")
+  target_lang      String                     @default("English") @db.VarChar(40)
+  status           String                     @default("queued") @db.VarChar(20)
+  stage            String                     @default("queued") @db.VarChar(40)
   message          String?
-  progress         Int       @default(0)
-  total_pages      Int       @default(0)
-  current_page     Int       @default(0)
-  pages            Json      @default("[]")
-  translated_pages Json      @default("[]")
-  output_path      String?
-  created_at       DateTime  @default(now())
-  updated_at       DateTime  @updatedAt
-  completed_at     DateTime?
+  progress         Int                        @default(0)
+  total_pages      Int                        @default(0)
+  current_page     Int                        @default(0)
+  document_context Json?
+  metrics          Json                       @default("{}")
+  input_pdf        Bytes
   output_pdf       Bytes?
-  user             users     @relation(fields: [user_id], references: [id], onDelete: Cascade, map: "pdf_translation_jobs_user_id_fkey")
+  created_at       DateTime                   @default(now()) @db.Timestamptz(6)
+  updated_at       DateTime                   @default(now()) @updatedAt @db.Timestamptz(6)
+  completed_at     DateTime?                  @db.Timestamptz(6)
+  user             users                      @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "pdf_translation_v2_jobs_user_id_fkey")
+  pages            pdf_translation_v2_pages[]
 
-  @@map("pdf_translation_jobs")
+  @@index([user_id, created_at(sort: Desc)], map: "idx_pdf_translation_v2_jobs_user_created")
+  @@index([status, created_at], map: "idx_pdf_translation_v2_jobs_status_created")
 }
 
-model pdf_translations {
-  id                Int                 @id @default(autoincrement())
-  job_id            String              @unique(map: "ix_pdf_translations_job_id") @db.VarChar(64)
-  user_id           Int
-  original_filename String              @db.VarChar(255)
-  file_path         String              @db.VarChar(500)
-  file_size         Int?
-  source_language   String?             @db.VarChar(10)
-  target_language   String              @db.VarChar(10)
-  total_pages       Int
-  total_words       Int?
-  status            String?             @db.VarChar(20)
-  created_at        DateTime?           @db.Timestamp(6)
-  started_at        DateTime?           @db.Timestamp(6)
-  completed_at      DateTime?           @db.Timestamp(6)
-  processing_time   Float?
-  success_pages     Int?
-  failed_pages      Int?
-  error_message     String?
-  ocr_method        String?             @db.VarChar(50)
-  users             users               @relation(fields: [user_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  translation_pages translation_pages[]
+model pdf_translation_v2_pages {
+  id                   Int                     @id @default(autoincrement())
+  job_id               String                  @db.Uuid
+  page_number          Int
+  status               String                  @default("pending") @db.VarChar(20)
+  source_layout        Json?
+  translated_layout    Json?
+  source_text          String?
+  translated_text      String?
+  extraction_model     String?                 @db.VarChar(80)
+  translation_model    String?                 @db.VarChar(80)
+  extraction_attempts  Int                     @default(0)
+  translation_attempts Int                     @default(0)
+  input_tokens         Int                     @default(0)
+  output_tokens        Int                     @default(0)
+  validation           Json?
+  warnings             Json                    @default("[]")
+  error_message        String?
+  created_at           DateTime                @default(now()) @db.Timestamptz(6)
+  updated_at           DateTime                @default(now()) @updatedAt @db.Timestamptz(6)
+  job                  pdf_translation_v2_jobs @relation(fields: [job_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "pdf_translation_v2_pages_job_id_fkey")
+
+  @@unique([job_id, page_number], map: "pdf_translation_v2_pages_job_page_key")
+  @@index([job_id, status, page_number], map: "idx_pdf_translation_v2_pages_job_status")
 }
 
 model publications {
@@ -148,37 +151,6 @@ model publications {
   source    String?
   image_url String?
   save_time DateTime? @db.Timestamptz(6)
-}
-
-model translation_history {
-  id                     Int       @id @default(autoincrement())
-  user_id                Int
-  total_translations     Int?
-  total_pages_processed  Int?
-  total_words_translated Int?
-  total_processing_time  Float?
-  most_used_source_lang  String?   @db.VarChar(10)
-  most_used_target_lang  String?   @db.VarChar(10)
-  first_translation      DateTime? @db.Timestamp(6)
-  last_translation       DateTime? @db.Timestamp(6)
-  last_updated           DateTime? @db.Timestamp(6)
-  users                  users     @relation(fields: [user_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
-}
-
-model translation_pages {
-  id                    Int              @id @default(autoincrement())
-  translation_id        Int
-  page_number           Int
-  original_text         String?
-  translated_text       String?
-  original_word_count   Int?
-  translated_word_count Int?
-  extraction_method     String?          @db.VarChar(50)
-  processing_time       Float?
-  status                String?          @db.VarChar(20)
-  error_message         String?
-  created_at            DateTime?        @db.Timestamp(6)
-  pdf_translations      pdf_translations @relation(fields: [translation_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
 }
 
 model user_preferences {
@@ -218,14 +190,12 @@ model users {
   likes                                          likes[]
   meeting_participants                           meeting_participants[]
   meetings                                       meetings[]
-  pdf_translation_jobs                           pdf_translation_jobs[]
-  pdf_translations                               pdf_translations[]
+  pdf_translation_v2_jobs                        pdf_translation_v2_jobs[]
   questions_questions_asked_by_user_idTousers    questions[]                   @relation("questions_asked_by_user_idTousers")
   questions_questions_resolved_by_user_idTousers questions[]                   @relation("questions_resolved_by_user_idTousers")
   risks                                          risks[]
   speaker_mappings                               speaker_mappings[]
   transcript_segments                            transcript_segments[]
-  translation_history                            translation_history[]
   user_preferences                               user_preferences[]
   user_activity                                  user_activity[]
   background_jobs                                background_jobs[]

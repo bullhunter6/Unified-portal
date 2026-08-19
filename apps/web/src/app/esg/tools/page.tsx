@@ -2,10 +2,10 @@ import Link from "next/link";
 import { 
   Search, 
   FileSpreadsheet, 
-  FileText, 
   LayoutDashboard,
   ChevronRight,
-  Sparkles
+  Sparkles,
+  ScanText
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -13,7 +13,6 @@ import { cn } from "@/lib/utils";
 import EsgSearch from "./search";
 import EsgExcel from "./excel";
 import EsgDriversTool from "./drivers";
-import PdfxHome from "@/app/esg/pdfx/page";
 
 // Tool Configuration Types
 type ToolId = "overview" | "search" | "excel" | "drivers" | "pdfx";
@@ -25,6 +24,7 @@ interface ToolConfig {
   icon: any;
   component: React.ComponentType<any>;
   description?: string;
+  href?: string;
 }
 
 // ESG Tool Configurations
@@ -57,12 +57,13 @@ const TOOLS: ToolConfig[] = [
     component: EsgDriversTool,
     description: "Generate country and sector ESG driver packs with evidence"
   },
-  { 
-    id: "pdfx", 
-    label: "PDF Translator", 
-    icon: FileText, 
-    component: PdfxHome,
-    description: "Translate and analyze PDF documents"
+  {
+    id: "pdfx",
+    label: "PDF Translator",
+    icon: ScanText,
+    component: () => null,
+    description: "High-accuracy OpenAI translation with visual table recovery",
+    href: "/esg/tools/pdf-translator-2"
   }
 ];
 
@@ -99,9 +100,9 @@ export default async function ToolsPage({
             {domainTools.map((tool) => {
               const Icon = tool.icon;
               const isActive = activeToolId === tool.id;
-              const href = tool.id === "overview" 
+              const href = tool.href ?? (tool.id === "overview"
                 ? `/esg/tools`
-                : `/esg/tools?tool=${tool.id}`;
+                : `/esg/tools?tool=${tool.id}`);
               
               return (
                 <Link
@@ -158,7 +159,7 @@ export default async function ToolsPage({
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                   {domainTools.filter(t => t.id !== "overview").map((tool) => {
                     const Icon = tool.icon;
-                    const href = `/esg/tools?tool=${tool.id}`;
+                    const href = tool.href ?? `/esg/tools?tool=${tool.id}`;
                     return (
                       <Link
                         key={tool.id}

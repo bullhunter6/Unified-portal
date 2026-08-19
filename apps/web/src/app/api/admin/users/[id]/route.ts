@@ -479,13 +479,8 @@ export async function DELETE(
       where: { user_id: userId },
     });
 
-    // Delete PDF translation jobs (user_id is nullable)
-    await esgPrisma.pdf_translation_jobs.deleteMany({
-      where: { user_id: userId },
-    });
-
-    // Delete translation_history
-    await esgPrisma.translation_history.deleteMany({
+    // Delete OpenAI PDF translation jobs and their cascaded page checkpoints.
+    await esgPrisma.pdf_translation_v2_jobs.deleteMany({
       where: { user_id: userId },
     });
 

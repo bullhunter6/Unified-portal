@@ -313,7 +313,6 @@ CRON_SECRET=                # openssl rand -hex 32
 
 NODE_ENV=production
 PORT=3000
-PDFX_STORAGE_DIR=.pdfx_store
 
 MAIL_SERVER=smtp.gmail.com
 MAIL_PORT=587
@@ -323,6 +322,10 @@ MAIL_FROM=
 
 OPENAI_API_KEY=
 OPENAI_ESG_DRIVERS_MODEL=gpt-5.4-mini
+OPENAI_PDFX2_EXTRACT_MODEL=gpt-5.6-terra
+OPENAI_PDFX2_TRANSLATE_MODEL=gpt-5.6-terra
+OPENAI_PDFX2_RETRY_MODEL=gpt-5.6-sol
+OPENAI_PDFX2_VALIDATE_MODEL=gpt-5.6-terra
 GOOGLE_API_KEY_2=
 GOOGLE_CSE_ID_2=
 TAVILY_API_KEY=
@@ -331,6 +334,21 @@ WORKER_CONCURRENCY=2
 WORKER_EMAIL_POLL_MS=5000
 WORKBOOK_WORKER_CONCURRENCY=2
 ```
+
+PDF Translator requires all ESG migrations, including
+`20260819090000_pdf_translation_v2` and
+`20260819170000_remove_legacy_pdf_translator`, before the web or worker is
+restarted.
+It uses OpenAI PDF vision inputs and Structured Outputs one source page at a
+time; it does not require OCRmyPDF/Tesseract, but the worker must have access to
+the configured OpenAI models. Terra is the accuracy-first default, with Sol as
+the final per-page recovery model. Set all four variables explicitly if the
+account uses different approved model aliases.
+
+The removal migration permanently deletes Translator 1 queue records, output
+PDFs, and legacy translation history. Back up those tables before deployment
+only if their retired data must be archived; Translator 2 jobs and pages are not
+affected.
 
 **`.env` syntax rules** - `set -a; source .env` is real shell, so:
 - **no space after `=`** (`KEY= value` makes the value *empty*)
@@ -496,13 +514,6 @@ RDS security group must allow 5432 from the EC2 security group. Test:
 pnpm -C apps/web worker:check-db
 ```
 
-### `ERR_PACKAGE_PATH_NOT_EXPORTED` for `unicorn-magic`
-This happens before any database connection. An older PDF worker loaded the
-ESM-only `execa` dependency through `tsx`'s CommonJS registration path. Do not
-edit `node_modules` or change RDS settings. Deploy a commit containing the
-PDF extractor's dynamic `import('execa')` fix, reinstall from the lockfile, and
-rerun `worker:check-db` before switching the production symlink.
-
 ### `Failed to find Server Action "..."`
 Cached JS from the previous build. Hard-refresh (Ctrl+Shift+R). Harmless.
 
@@ -568,9 +579,8 @@ pm2 flush                                # old logs
 
 - Both Prisma clients **throw at import time** if their URL is unset, and Next
   imports every API route while collecting page data.
-- Five modules run `new OpenAI(...)` at **module scope** (`pdfx/translate`,
-  `tenders/classifier`, `tenders/processor`, `tenders/translator`,
-  `tenders/translator-simple`), so those keys must be *present*.
+- Several tender-processing modules run `new OpenAI(...)` at **module scope**,
+  so those keys must be *present*.
 - `/credit/publications` executes `prisma.$queryRaw()` during prerender, so a
   reachable, migrated database is genuinely required.
 

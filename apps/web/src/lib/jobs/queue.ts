@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { esgPrisma } from "@esgcredit/db-esg";
 
 export const BACKGROUND_JOB_TYPES = [
-  "pdf_translation",
+  "pdf_translation_v2",
   "esg_workbook",
   "fitch_workbook",
   "esg_driver",
@@ -396,18 +396,13 @@ export async function completeBackgroundJob(
   return updated > 0;
 }
 
-/**
- * Commit the PDF domain result and its queue transition together. The PDF bytes
- * live only on pdf_translation_jobs; background_jobs records lifecycle/result
- * metadata without retaining a duplicate output blob.
- */
-export async function completePdfTranslationJob(
+export async function completePdfTranslationV2Job(
   id: string,
   userId: number,
   leaseOwner: string,
   args: {
     outputPdf: Buffer;
-    translatedPages: unknown;
+    metrics: unknown;
     result: unknown;
     message: string;
   },
@@ -421,7 +416,7 @@ export async function completePdfTranslationJob(
       SELECT id
       FROM background_jobs
       WHERE id = ${id}::uuid
-        AND job_type = 'pdf_translation'
+        AND job_type = 'pdf_translation_v2'
         AND user_id = ${userId}
         AND status = 'processing'
         AND lease_owner = ${leaseOwner}
@@ -430,13 +425,14 @@ export async function completePdfTranslationJob(
       FOR UPDATE
     ),
     updated_domain AS (
-      UPDATE pdf_translation_jobs AS domain
+      UPDATE pdf_translation_v2_jobs AS domain
       SET status = 'completed',
+          stage = 'completed',
           message = ${args.message},
           progress = 100,
-          output_path = ${`db://pdf_translation_jobs/${id}/output`},
+          current_page = domain.total_pages,
           output_pdf = ${args.outputPdf},
-          translated_pages = ${JSON.stringify(args.translatedPages ?? null)}::jsonb,
+          metrics = ${JSON.stringify(args.metrics ?? {})}::jsonb,
           completed_at = now(),
           updated_at = now()
       FROM eligible_queue AS queue
@@ -469,32 +465,7 @@ export async function completePdfTranslationJob(
   const result = completion[0];
   if (result?.queue_completed) return;
   if (result?.queue_eligible && !result.domain_updated) {
-    throw new Error("PDF translation record is missing or already terminal");
-  }
-  if (result?.queue_eligible) {
-    throw new Error("PDF background job could not be completed");
-  }
-
-  const state = await esgPrisma.$queryRaw<Array<{
-    cancel_requested: boolean;
-    lease_owner: string | null;
-    lease_valid: boolean;
-    status: BackgroundJobStatus;
-  }>>`
-    SELECT cancel_requested, lease_owner,
-           lease_expires_at >= now() AS lease_valid, status
-    FROM background_jobs
-    WHERE id = ${id}::uuid AND user_id = ${userId}
-    LIMIT 1
-  `;
-  const current = state[0];
-  if (
-    current?.cancel_requested &&
-    current.status === "processing" &&
-    current.lease_owner === leaseOwner &&
-    current.lease_valid
-  ) {
-    throw new JobCancelledError();
+    throw new Error("PDF Translator record is missing or already terminal");
   }
   throw new JobLeaseLostError();
 }
@@ -600,7 +571,7 @@ export async function cleanupTerminalPdfJobBlobs(
   return esgPrisma.$executeRaw`
     UPDATE background_jobs
     SET input_data = NULL, output_data = NULL, updated_at = now()
-    WHERE job_type = 'pdf_translation'
+    WHERE job_type = 'pdf_translation_v2'
       AND status IN ('done', 'error', 'cancelled')
       AND completed_at < now() - (${retentionSeconds} * INTERVAL '1 second')
       AND (input_data IS NOT NULL OR output_data IS NOT NULL)
@@ -688,14 +659,20 @@ async function synchronizeReapedJobs(
           updated_at: new Date(),
         },
       });
-    } else if (job.job_type === "pdf_translation") {
-      await esgPrisma.pdf_translation_jobs.updateMany({
+    } else if (job.job_type === "pdf_translation_v2") {
+      await esgPrisma.pdf_translation_v2_jobs.updateMany({
         where: {
           id: job.id,
           user_id: job.user_id,
           status: { in: ["queued", "processing", "cancelling"] },
         },
-        data: { status, message, progress: 100, completed_at: new Date() },
+        data: {
+          status,
+          stage: status,
+          message,
+          progress: 100,
+          completed_at: new Date(),
+        },
       });
     } else if (job.job_type === "esg_driver") {
       await esgPrisma.$executeRaw`
@@ -747,8 +724,9 @@ export async function reconcileTerminalDomainJobs(): Promise<void> {
       AND domain.status IN ('queued', 'processing')
   `;
   await esgPrisma.$executeRaw`
-    UPDATE pdf_translation_jobs AS domain
+    UPDATE pdf_translation_v2_jobs AS domain
     SET status = queue.status,
+        stage = queue.status,
         progress = 100,
         message = CASE
           WHEN queue.status = 'error' THEN COALESCE(queue.last_error, 'Worker failed')
@@ -758,7 +736,7 @@ export async function reconcileTerminalDomainJobs(): Promise<void> {
         updated_at = now()
     FROM background_jobs AS queue
     WHERE queue.id = domain.id
-      AND queue.job_type = 'pdf_translation'
+      AND queue.job_type = 'pdf_translation_v2'
       AND queue.status IN ('error', 'cancelled')
       AND domain.status IN ('queued', 'processing', 'cancelling')
   `;
