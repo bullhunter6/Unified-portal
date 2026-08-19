@@ -25,7 +25,7 @@ import {
   throwIfJobCancelled,
   type ClaimedBackgroundJob,
 } from "@/lib/jobs/queue";
-import { processPdfTranslationJob } from "@/lib/pdfx/pipeline";
+import { processPdfTranslationV2Job } from "@/lib/pdfx-v2/pipeline";
 import {
   createTransientPollState,
   pollWithTransientBackoff,
@@ -68,7 +68,7 @@ async function main(): Promise<void> {
             workerId,
             availableSlots,
             90,
-            ["esg_driver", "pdf_translation"],
+            ["esg_driver", "pdf_translation_v2"],
             "generic",
           ),
           isTransientPrismaConnectivityError,
@@ -161,8 +161,8 @@ async function executeJob(job: ClaimedBackgroundJob): Promise<void> {
   try {
     const output = job.jobType === "esg_driver"
       ? await runEsgDriverGenerationJob(job as any)
-      : job.jobType === "pdf_translation"
-        ? await processPdfTranslationJob(job as any)
+      : job.jobType === "pdf_translation_v2"
+        ? await processPdfTranslationV2Job(job as any)
         : (() => {
             throw new Error(`Unsupported job type for worker: ${job.jobType}`);
           })();
@@ -180,8 +180,8 @@ async function executeJob(job: ClaimedBackgroundJob): Promise<void> {
       const transitioned = job.jobType === "esg_driver"
         ? await markEsgDriverJobCancelled(job.id, job.leaseOwner)
         : await markBackgroundJobCancelled(job.id, job.leaseOwner);
-      if (transitioned && job.jobType === "pdf_translation") {
-        await synchronizePdfDomainJob(job, "cancelled", "Cancelled");
+      if (transitioned && job.jobType === "pdf_translation_v2") {
+        await synchronizePdfV2DomainJob(job, "cancelled", "Cancelled");
       }
       if (!transitioned) {
         console.warn(`[esg-driver-worker] cancellation lease lost for ${job.id}`);
@@ -194,18 +194,17 @@ async function executeJob(job: ClaimedBackgroundJob): Promise<void> {
     }
 
     const message = error instanceof Error ? error.message : "Worker failure";
-    const transition =
-      job.jobType === "esg_driver"
-        ? await failEsgDriverJob(job, message, {
-            retryable: isRetryableEsgDriverFailure(error),
-          })
-        : await failBackgroundJob(job, message);
+    const transition = job.jobType === "esg_driver"
+      ? await failEsgDriverJob(job, message, {
+          retryable: isRetryableEsgDriverFailure(error),
+        })
+      : await failBackgroundJob(job, message);
     if (!transition.transitioned) {
       console.warn(`[esg-driver-worker] failure lease lost for ${job.id}`);
       return;
     }
-    if (job.jobType === "pdf_translation") {
-      await synchronizePdfDomainJob(
+    if (job.jobType === "pdf_translation_v2") {
+      await synchronizePdfV2DomainJob(
         job,
         transition.status === "error" ? "error" : "queued",
         transition.status === "error" ? message : "Retry scheduled",
@@ -223,7 +222,8 @@ async function verifyWorkerSchema(): Promise<void> {
   const requiredTables = [
     "background_jobs",
     "esg_driver_jobs",
-    "pdf_translation_jobs",
+    "pdf_translation_v2_jobs",
+    "pdf_translation_v2_pages",
     "api_usage_buckets",
     "alert_history",
     "email_queue",
@@ -255,13 +255,13 @@ async function verifyWorkerSchema(): Promise<void> {
   }
 }
 
-async function synchronizePdfDomainJob(
+async function synchronizePdfV2DomainJob(
   job: ClaimedBackgroundJob,
   status: "queued" | "error" | "cancelled",
   message: string,
 ): Promise<void> {
   const terminal = status !== "queued";
-  await esgPrisma.pdf_translation_jobs.updateMany({
+  await esgPrisma.pdf_translation_v2_jobs.updateMany({
     where: {
       id: job.id,
       user_id: job.userId,
@@ -269,6 +269,7 @@ async function synchronizePdfDomainJob(
     },
     data: {
       status,
+      stage: status,
       message,
       progress: terminal ? 100 : Math.min(job.progress, 99),
       completed_at: terminal ? new Date() : null,

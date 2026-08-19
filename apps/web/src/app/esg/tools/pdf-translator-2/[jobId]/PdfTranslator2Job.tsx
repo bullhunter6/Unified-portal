@@ -1,0 +1,244 @@
+'use client';
+
+import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
+import Link from 'next/link';
+import {
+  AlertTriangle,
+  ArrowLeft,
+  CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
+  Download,
+  Eye,
+  EyeOff,
+  FileText,
+  Languages,
+  LoaderCircle,
+  RotateCcw,
+  StopCircle,
+} from 'lucide-react';
+import { PdfTextContent } from '@/components/pdfx-v2/PdfTextContent';
+
+type JobStatus = {
+  id: string;
+  filename: string;
+  targetLang: string;
+  status: string;
+  stage: string;
+  message: string | null;
+  progress: number;
+  totalPages: number;
+  currentPage: number;
+  attempts: number;
+  maxAttempts: number;
+};
+
+type PageData = {
+  pageNumber: number;
+  status: string;
+  originalText: string;
+  translatedText: string;
+  warnings: unknown;
+};
+
+type PaneKey = 'source' | 'original' | 'translated';
+type PaneVisibility = Record<PaneKey, boolean>;
+
+const ACTIVE = new Set(['queued', 'processing', 'cancelling']);
+const PANE_LABELS: Record<PaneKey, string> = {
+  source: 'Source PDF',
+  original: 'Original text',
+  translated: 'Translated text',
+};
+
+export default function PdfTranslator2Job({ jobId }: { jobId: string }) {
+  const workspaceRef = useRef<HTMLDivElement>(null);
+  const [job, setJob] = useState<JobStatus | null>(null);
+  const [pages, setPages] = useState<PageData[]>([]);
+  const [selectedPage, setSelectedPage] = useState(1);
+  const [visiblePanes, setVisiblePanes] = useState<PaneVisibility>({
+    source: false,
+    original: true,
+    translated: true,
+  });
+  const [error, setError] = useState('');
+  const [cancelling, setCancelling] = useState(false);
+
+  const refresh = useCallback(async () => {
+    const [statusResponse, pagesResponse] = await Promise.all([
+      fetch(`/api/pdfx-v2/status?jobId=${encodeURIComponent(jobId)}`, { cache: 'no-store' }),
+      fetch(`/api/pdfx-v2/pages?jobId=${encodeURIComponent(jobId)}`, { cache: 'no-store' }),
+    ]);
+    const statusPayload = await statusResponse.json().catch(() => ({})) as { job?: JobStatus; error?: string };
+    if (!statusResponse.ok || !statusPayload.job) throw new Error(statusPayload.error ?? 'Unable to load job');
+    setJob(statusPayload.job);
+    if (pagesResponse.ok) {
+      const pagePayload = await pagesResponse.json() as { pages?: PageData[] };
+      setPages(pagePayload.pages ?? []);
+    }
+    return statusPayload.job;
+  }, [jobId]);
+
+  useEffect(() => {
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      try {
+        const current = await refresh();
+        setError('');
+        if (!stopped && ACTIVE.has(current.status)) timer = setTimeout(() => void poll(), 1800);
+      } catch (caught) {
+        if (!stopped) {
+          setError(caught instanceof Error ? caught.message : 'Unable to load translation');
+          timer = setTimeout(() => void poll(), 4000);
+        }
+      }
+    };
+    void poll();
+    return () => { stopped = true; if (timer) clearTimeout(timer); };
+  }, [refresh]);
+
+  const cancel = async () => {
+    setCancelling(true);
+    const response = await fetch('/api/pdfx-v2/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jobId }),
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({})) as { error?: string };
+      setError(payload.error ?? 'Unable to cancel');
+    }
+    setCancelling(false);
+    void refresh();
+  };
+
+  const togglePane = (pane: PaneKey) => {
+    setVisiblePanes((current) => {
+      const openCount = Object.values(current).filter(Boolean).length;
+      if (current[pane] && openCount === 1) return current;
+      return { ...current, [pane]: !current[pane] };
+    });
+  };
+
+  const changePage = (nextPage: number) => {
+    const safePage = Math.max(1, Math.min(job?.totalPages || 1, nextPage));
+    setSelectedPage(safePage);
+    requestAnimationFrame(() => workspaceRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' }));
+  };
+
+  const page = pages.find((item) => item.pageNumber === selectedPage);
+  const isActive = !!job && ACTIVE.has(job.status);
+  const visiblePaneCount = Object.values(visiblePanes).filter(Boolean).length;
+  const workspaceColumns = visiblePaneCount === 3
+    ? 'xl:grid-cols-[minmax(300px,.82fr)_minmax(0,1fr)_minmax(0,1fr)]'
+    : visiblePaneCount === 2
+      ? 'lg:grid-cols-2'
+      : 'grid-cols-1';
+
+  return (
+    <main className="min-h-[calc(100vh-65px)] bg-[#f3f0e8] text-slate-950">
+      <header className="border-b border-slate-900/10 bg-white">
+        <div className="mx-auto max-w-[1700px] px-4 py-5 sm:px-7">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div className="flex min-w-0 items-center gap-4">
+              <Link href="/esg/tools/pdf-translator-2" aria-label="Back to PDF Translator" className="rounded-full border border-slate-200 p-2 text-slate-500 transition hover:bg-slate-50 hover:text-slate-900"><ArrowLeft className="h-4 w-4" /></Link>
+              <div className="min-w-0"><p className="text-xs font-semibold uppercase tracking-[.18em] text-amber-700">OpenAI PDF Translator</p><h1 className="truncate font-serif text-2xl">{job?.filename ?? 'Loading translation…'}</h1></div>
+            </div>
+            <div className="flex items-center gap-2">
+              {isActive && <button type="button" disabled={cancelling} onClick={() => void cancel()} className="inline-flex items-center gap-2 rounded-lg border border-red-200 px-4 py-2 text-sm font-semibold text-red-700 transition hover:bg-red-50 disabled:opacity-50"><StopCircle className="h-4 w-4" />Cancel</button>}
+              {job?.status === 'completed' && <a href={`/api/pdfx-v2/download?jobId=${encodeURIComponent(jobId)}`} className="inline-flex items-center gap-2 rounded-lg bg-[#132a33] px-4 py-2 text-sm font-semibold text-white transition hover:bg-[#1c3a45]"><Download className="h-4 w-4" />Download PDF</a>}
+            </div>
+          </div>
+
+          {job && (
+            <div className="mt-5 grid gap-3 sm:grid-cols-[1fr_auto] sm:items-center">
+              <div>
+                <div className="mb-2 flex justify-between gap-4 text-xs"><span className="font-medium text-slate-700">{job.message ?? job.stage}</span><span className="font-mono font-bold">{job.progress}%</span></div>
+                <div className="h-2 overflow-hidden rounded-full bg-slate-200"><div className="h-full rounded-full bg-gradient-to-r from-amber-500 to-emerald-600 transition-all duration-500" style={{ width: `${Math.max(0, Math.min(100, job.progress))}%` }} /></div>
+              </div>
+              <div className="text-xs text-slate-500">Page {job.currentPage || '—'} / {job.totalPages} · attempt {Math.max(job.attempts, 1)} of {job.maxAttempts || 3}</div>
+            </div>
+          )}
+        </div>
+      </header>
+
+      <div className="mx-auto max-w-[1700px] px-4 py-5 sm:px-7">
+        {error && <div className="mb-4 flex items-center gap-3 rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-800"><AlertTriangle className="h-5 w-5" />{error}<button type="button" onClick={() => void refresh()} className="ml-auto inline-flex items-center gap-1 font-semibold"><RotateCcw className="h-4 w-4" />Retry</button></div>}
+        {job?.status === 'completed' && <div className="mb-4 flex items-center gap-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-900"><CheckCircle2 className="h-5 w-5" />Every accepted page passed structure, numeric, and target-language validation.</div>}
+        {job?.status === 'error' && <div className="mb-4 flex items-start gap-3 rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-900"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" /><span><strong>Translation stopped safely.</strong> {job.message} Successful page checkpoints were retained during automatic retries.</span></div>}
+
+        <div className="sticky top-[65px] z-30 mb-4 rounded-xl border border-slate-200 bg-white/95 p-3 shadow-sm backdrop-blur" aria-label="Document review controls">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <button type="button" aria-label="Previous page" disabled={selectedPage <= 1} onClick={() => changePage(selectedPage - 1)} className="grid h-9 w-9 place-items-center rounded-lg border border-slate-200 text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-35"><ChevronLeft className="h-4 w-4" /></button>
+              <label className="flex items-center gap-2 text-xs font-semibold text-slate-500">
+                <span>Page</span>
+                <select value={selectedPage} onChange={(event) => changePage(Number(event.target.value))} className="h-9 rounded-lg border border-slate-300 bg-white px-3 text-sm font-bold text-slate-900 outline-none focus:border-amber-600 focus:ring-2 focus:ring-amber-200">
+                  {Array.from({ length: job?.totalPages ?? 0 }, (_, index) => index + 1).map((number) => {
+                    const item = pages.find((candidate) => candidate.pageNumber === number);
+                    return <option key={number} value={number}>{number}{item?.status === 'translated' ? ' · Ready' : ''}</option>;
+                  })}
+                </select>
+                <span>of {job?.totalPages || '—'}</span>
+              </label>
+              <button type="button" aria-label="Next page" disabled={selectedPage >= (job?.totalPages || 1)} onClick={() => changePage(selectedPage + 1)} className="grid h-9 w-9 place-items-center rounded-lg border border-slate-200 text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-35"><ChevronRight className="h-4 w-4" /></button>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="mr-1 hidden text-xs font-semibold text-slate-400 sm:inline">Visible panels</span>
+              {(Object.keys(PANE_LABELS) as PaneKey[]).map((paneKey) => (
+                <PaneToggle key={paneKey} label={PANE_LABELS[paneKey]} visible={visiblePanes[paneKey]} disabled={visiblePanes[paneKey] && visiblePaneCount === 1} onClick={() => togglePane(paneKey)} />
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div ref={workspaceRef} className={`grid scroll-mt-36 items-start gap-4 ${workspaceColumns}`}>
+          {visiblePanes.source && (
+            <section className="min-w-0 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+              <PaneHeader title="Source PDF" detail="Selected page" icon={<FileText className="h-4 w-4" />} collapseDisabled={visiblePaneCount === 1} onCollapse={() => togglePane('source')} />
+              <iframe title={`Original source PDF, page ${selectedPage}`} src={`/api/pdfx-v2/file?jobId=${encodeURIComponent(jobId)}&page=${selectedPage}#toolbar=0&navpanes=0&scrollbar=0&view=FitH`} className="h-[min(78vh,900px)] min-h-[560px] w-full bg-slate-200" />
+            </section>
+          )}
+          {visiblePanes.original && (
+            <TextPane title="Original text" text={page?.originalText ?? ''} emptyLabel={isActive ? 'This page has not been read yet.' : 'No source text was captured.'} tone="original" collapseDisabled={visiblePaneCount === 1} onCollapse={() => togglePane('original')} />
+          )}
+          {visiblePanes.translated && (
+            <TextPane title={`Translated text · ${job?.targetLang ?? ''}`} text={page?.translatedText ?? ''} emptyLabel={isActive ? 'This page has not been translated yet.' : 'No translated text is available.'} tone="translated" collapseDisabled={visiblePaneCount === 1} onCollapse={() => togglePane('translated')} />
+          )}
+        </div>
+      </div>
+    </main>
+  );
+}
+
+function PaneToggle({ label, visible, disabled, onClick }: { label: string; visible: boolean; disabled: boolean; onClick: () => void }) {
+  return (
+    <button type="button" aria-pressed={visible} disabled={disabled} onClick={onClick} className={`inline-flex h-9 items-center gap-1.5 rounded-lg border px-3 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${visible ? 'border-[#132a33] bg-[#132a33] text-white' : 'border-slate-200 bg-white text-slate-500 hover:border-slate-300 hover:text-slate-900'}`}>
+      {visible ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />}{label}
+    </button>
+  );
+}
+
+function PaneHeader({ title, detail, icon, collapseDisabled, onCollapse }: { title: string; detail?: string; icon: ReactNode; collapseDisabled: boolean; onCollapse: () => void }) {
+  return (
+    <div className="flex min-h-12 items-center justify-between gap-3 border-b border-slate-200 bg-slate-50 px-4">
+      <div className="flex items-center gap-2 text-sm font-bold">{icon}<span>{title}</span>{detail && <span className="text-[10px] font-medium uppercase tracking-wider text-slate-400">{detail}</span>}</div>
+      <button type="button" disabled={collapseDisabled} onClick={onCollapse} aria-label={`Collapse ${title}`} title={collapseDisabled ? 'Keep at least one panel visible' : `Collapse ${title}`} className="rounded-md p-1.5 text-slate-400 transition hover:bg-white hover:text-slate-800 disabled:cursor-not-allowed disabled:opacity-35"><EyeOff className="h-4 w-4" /></button>
+    </div>
+  );
+}
+
+function TextPane({ title, text, emptyLabel, tone, collapseDisabled, onCollapse }: { title: string; text: string; emptyLabel: string; tone: 'original' | 'translated'; collapseDisabled: boolean; onCollapse: () => void }) {
+  return (
+    <section className="min-w-0 rounded-xl border border-slate-200 bg-white shadow-sm">
+      <div className={`flex min-h-12 items-center justify-between gap-3 rounded-t-xl border-b px-4 ${tone === 'translated' ? 'border-amber-200 bg-amber-50' : 'border-slate-200 bg-slate-50'}`}>
+        <div className="flex min-w-0 items-center gap-2 text-sm font-bold"><Languages className={`h-4 w-4 shrink-0 ${tone === 'translated' ? 'text-amber-700' : 'text-slate-500'}`} /><span className="truncate">{title}</span></div>
+        <button type="button" disabled={collapseDisabled} onClick={onCollapse} aria-label={`Collapse ${title}`} title={collapseDisabled ? 'Keep at least one panel visible' : `Collapse ${title}`} className="rounded-md p-1.5 text-slate-400 transition hover:bg-white hover:text-slate-800 disabled:cursor-not-allowed disabled:opacity-35"><EyeOff className="h-4 w-4" /></button>
+      </div>
+      <div className="p-5 sm:p-6" dir="auto">
+        <PdfTextContent text={text} label={title} emptyLabel={emptyLabel} fontSize={13} tone={tone} />
+      </div>
+    </section>
+  );
+}

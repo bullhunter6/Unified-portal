@@ -91,9 +91,9 @@ const domainThemes: Record<Domain, DomainTheme> = {
         icon: BookOpen,
       },
       {
-        href: "/esg/pdfx",
+        href: "/esg/tools/pdf-translator-2",
         label: "PDF translation",
-        description: "Translate source documents with OCR support.",
+        description: "Translate normal and scanned documents with structured tables.",
         icon: Languages,
       },
     ],
