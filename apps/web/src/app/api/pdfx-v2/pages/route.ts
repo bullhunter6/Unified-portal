@@ -9,8 +9,14 @@ export const dynamic = 'force-dynamic';
 export async function GET(request: Request) {
   const auth = await requirePdfxUser();
   if (auth.response) return auth.response;
-  const jobId = new URL(request.url).searchParams.get('jobId') ?? '';
+  const searchParams = new URL(request.url).searchParams;
+  const jobId = searchParams.get('jobId') ?? '';
+  const pageParam = searchParams.get('page') ?? '';
   if (!isUuid(jobId)) return NextResponse.json({ error: 'Invalid jobId' }, { status: 400 });
+  if (!/^[1-9]\d*$/.test(pageParam)) {
+    return NextResponse.json({ error: 'Invalid page' }, { status: 400 });
+  }
+  const selectedPage = Number(pageParam);
 
   const job = await esgPrisma.pdf_translation_v2_jobs.findFirst({
     where: { id: jobId, user_id: auth.userId },
@@ -18,7 +24,9 @@ export async function GET(request: Request) {
       status: true,
       total_pages: true,
       pages: {
+        where: { page_number: selectedPage },
         orderBy: { page_number: 'asc' },
+        take: 1,
         select: {
           page_number: true,
           status: true,
@@ -33,6 +41,9 @@ export async function GET(request: Request) {
     },
   });
   if (!job) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  if (selectedPage > job.total_pages) {
+    return NextResponse.json({ error: 'Page not found' }, { status: 404 });
+  }
   const response = NextResponse.json({
     success: true,
     status: job.status,

@@ -1,20 +1,15 @@
 import { makeTranslatedPdf } from './makeTranslatedPdf';
 import type { PdfPageLayout } from './schemas';
-import { pageLayoutToPlainText } from './serialize';
 
-/**
- * The structured page data and Unicode/table renderer share this isolated
- * pipeline, including pagination, RTL shaping, borders, and wide-page output.
- */
+/** Render the same clean, geometry-preserving layout shown in the UI. */
 export async function renderPdfxV2Document(
   translatedPages: readonly PdfPageLayout[],
   outputPath: string,
+  sourcePdf: Buffer,
 ) {
   return makeTranslatedPdf(
-    translatedPages.map((page) => ({
-      pageNumber: page.pageNumber,
-      text: pageLayoutToPlainText(page) || '[Blank translated page]',
-    })),
+    translatedPages,
+    sourcePdf,
     outputPath,
     'OpenAI PDF Translator',
   );

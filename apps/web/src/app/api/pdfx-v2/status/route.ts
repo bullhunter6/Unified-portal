@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { esgPrisma } from '@esgcredit/db-esg';
 import { requirePdfxUser } from '@/lib/pdfx-v2/auth';
 import { isUuid } from '@/lib/jobs/queue';
+import { PDFX_V2_QUEUE_JOB_TYPES } from '@/lib/pdfx-v2/constants';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -32,7 +33,11 @@ export async function GET(request: Request) {
       },
     }),
     esgPrisma.background_jobs.findFirst({
-      where: { id: jobId, user_id: auth.userId, job_type: 'pdf_translation_v2' },
+      where: {
+        id: jobId,
+        user_id: auth.userId,
+        job_type: { in: [...PDFX_V2_QUEUE_JOB_TYPES] },
+      },
       select: { status: true, progress: true, attempts: true, max_attempts: true, last_error: true },
     }),
   ]);
@@ -42,10 +47,12 @@ export async function GET(request: Request) {
   let status = row.status;
   let message = row.message;
   let progress = row.progress;
-  if (active && queue?.status === 'error') {
+  if (row.status === 'error') {
+    message = 'Translation could not continue automatically. Please contact support; completed pages were retained.';
+  } else if (active && queue?.status === 'error') {
     status = 'error';
     progress = 100;
-    message = queue.last_error ?? 'Translation failed';
+    message = 'Translation could not continue automatically. Please contact support; completed pages were retained.';
   } else if (active && queue?.status === 'cancelled') {
     status = 'cancelled';
     progress = 100;

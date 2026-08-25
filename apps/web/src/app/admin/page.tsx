@@ -27,6 +27,12 @@ interface Stats {
     uniqueUsers: number;
     totalCost: number;
   };
+  pdfTranslator?: {
+    totalJobs: number;
+    jobsLast30Days: number;
+    totalPages: number;
+    uniqueUsers: number;
+  };
 }
 
 export default function AdminDashboard() {
@@ -114,6 +120,17 @@ export default function AdminDashboard() {
       link: "/admin/ai-assistant",
       highlight: true,
     },
+    {
+      title: "PDF Translator",
+      value: stats.pdfTranslator?.jobsLast30Days || 0,
+      icon: "📄",
+      color: "cyan",
+      subtitle: stats.pdfTranslator
+        ? `${stats.pdfTranslator.totalPages} pages • ${stats.pdfTranslator.uniqueUsers} users`
+        : "No data yet",
+      link: "/admin/pdf-translator",
+      highlight: true,
+    },
   ];
 
   return (
@@ -126,7 +143,7 @@ export default function AdminDashboard() {
       </div>
 
       {/* Stats Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-6 mb-8">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-6 mb-8">
         {statCards.map((card) => {
           const cardContent = (
             <div

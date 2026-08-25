@@ -5,6 +5,40 @@ import type {
   PdfPageTranslation,
 } from './schemas';
 
+const TRANSLATABLE_ELEMENT_KINDS = new Set<PdfElement['kind']>([
+  'heading',
+  'paragraph',
+  'list',
+  'table',
+  'header',
+  'footer',
+]);
+
+export function isTextualElement(element: PdfElement): boolean {
+  return TRANSLATABLE_ELEMENT_KINDS.has(element.kind) || element.kind === 'suppressed_text';
+}
+
+export function isTranslatableElement(element: PdfElement): boolean {
+  return TRANSLATABLE_ELEMENT_KINDS.has(element.kind) && element.translate;
+}
+
+export function hasTranslatableText(layout: PdfPageLayout): boolean {
+  return layout.elements.some((element) => {
+    if (!isTranslatableElement(element)) return false;
+    if (element.kind !== 'table') return Boolean(element.text.trim());
+    return element.rows.some((row) => row.cells.some((cell) => cell.translate && cell.text.trim()));
+  });
+}
+
+export function listTextWithMarkers(text: string): string {
+  const lines = text.split(/\r?\n/g).map((line) => line.trim()).filter(Boolean);
+  return lines.map((line) =>
+    /^(?:[•‣◦▪*-]|\(?\d+[.)]|\(?[A-Za-zА-Яа-я][.)])\s+/.test(line)
+      ? line
+      : `• ${line}`,
+  ).join('\n');
+}
+
 function orderedElements(layout: PdfPageLayout): PdfElement[] {
   return [...layout.elements].sort(
     (left, right) => left.order - right.order || left.id.localeCompare(right.id),
@@ -35,11 +69,13 @@ function tableMatrix(element: PdfElement): string[][] {
 
 export function pageLayoutToPlainText(layout: PdfPageLayout): string {
   const blocks: string[] = [];
-  for (const element of orderedElements(layout)) {
+  for (const element of orderedElements(layout).filter(isTextualElement)) {
     if (element.kind === 'table') {
       const matrix = tableMatrix(element);
       if (element.text.trim()) blocks.push(element.text.trim());
       blocks.push(...matrix.map((row) => row.join('\t')));
+    } else if (element.kind === 'list' && element.text.trim()) {
+      blocks.push(listTextWithMarkers(element.text));
     } else if (element.text.trim()) {
       blocks.push(element.text.trim());
     }
@@ -52,13 +88,23 @@ export function pageLayoutForTranslation(layout: PdfPageLayout): object {
     pageNumber: layout.pageNumber,
     sourceLanguage: layout.sourceLanguage,
     sourceScript: layout.sourceScript,
-    elements: orderedElements(layout).map((element) => ({
+    elements: orderedElements(layout).filter(isTranslatableElement).map((element) => ({
       id: element.id,
       kind: element.kind,
+      translate: element.translate,
       text: element.text,
       cells: element.kind === 'table'
         ? element.rows.flatMap((row) =>
-            row.cells.map((cell) => ({ id: cell.id, text: cell.text })),
+            row.cells.map((cell) => ({
+              id: cell.id,
+              rowIndex: cell.rowIndex,
+              columnIndex: cell.columnIndex,
+              rowSpan: cell.rowSpan,
+              columnSpan: cell.columnSpan,
+              isHeader: cell.isHeader,
+              translate: cell.translate,
+              text: cell.text,
+            })),
           )
         : [],
     })),
@@ -76,6 +122,7 @@ export function mergePageTranslation(
     ...source,
     warnings: [...source.warnings, ...translation.warnings],
     elements: source.elements.map((element) => {
+      if (!isTranslatableElement(element)) return element;
       const translated = translatedElements.get(element.id);
       const translatedCells = new Map(
         (translated?.cells ?? []).map((cell) => [cell.id, cell.text]),
@@ -87,7 +134,7 @@ export function mergePageTranslation(
           ...row,
           cells: row.cells.map((cell) => ({
             ...cell,
-            text: translatedCells.get(cell.id) ?? '',
+            text: cell.translate ? translatedCells.get(cell.id) ?? '' : cell.text,
           })),
         })),
       };

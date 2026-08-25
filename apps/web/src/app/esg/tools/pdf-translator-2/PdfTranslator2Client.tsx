@@ -15,6 +15,7 @@ import {
   LoaderCircle,
   RefreshCw,
   ShieldCheck,
+  Trash2,
   UploadCloud,
   X,
 } from 'lucide-react';
@@ -61,6 +62,8 @@ export default function PdfTranslator2Client() {
   const [historyFilter, setHistoryFilter] = useState<HistoryFilter>('all');
   const [historyLoading, setHistoryLoading] = useState(true);
   const [historyError, setHistoryError] = useState('');
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState('');
 
   const loadHistory = useCallback(async () => {
     setHistoryLoading(true);
@@ -80,13 +83,39 @@ export default function PdfTranslator2Client() {
 
   useEffect(() => { void loadHistory(); }, [loadHistory]);
 
+  const deleteTranslation = async (item: HistoryItem) => {
+    if (ACTIVE_STATUSES.has(item.status) || deletingId) return;
+    const confirmed = window.confirm(
+      `Delete “${item.filename}”?\n\nThe saved source PDF, translated PDF, and page results will be permanently removed.`,
+    );
+    if (!confirmed) return;
+
+    setDeletingId(item.id);
+    setDeleteError('');
+    try {
+      const response = await fetch(`/api/pdfx-v2/jobs/${encodeURIComponent(item.id)}`, {
+        method: 'DELETE',
+      });
+      const payload = await response.json().catch(() => ({})) as { error?: string };
+      if (!response.ok) throw new Error(payload.error ?? 'Unable to delete this translation.');
+
+      setHistory((current) => current.filter((translation) => translation.id !== item.id));
+      setHistoryTotal((current) => Math.max(0, current - 1));
+      await loadHistory();
+    } catch (caught) {
+      setDeleteError(caught instanceof Error ? caught.message : 'Unable to delete this translation.');
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
   const chooseFile = (next: File | null) => {
     setError('');
     if (!next) return setFile(null);
     const isPdf = next.type === 'application/pdf' || next.name.toLowerCase().endsWith('.pdf');
     if (!isPdf) return setError('Choose a PDF document.');
     if (next.size < 1) return setError('The selected PDF is empty.');
-    if (next.size > MAX_PDF_UPLOAD_BYTES) return setError('The selected PDF exceeds 20 MB.');
+    if (next.size > MAX_PDF_UPLOAD_BYTES) return setError('The selected PDF exceeds 512 MB.');
     setFile(next);
   };
 
@@ -133,7 +162,7 @@ export default function PdfTranslator2Client() {
             </div>
             <div className="flex items-center gap-3 rounded-xl border border-white/15 bg-white/5 px-4 py-3 text-sm text-slate-200">
               <ShieldCheck className="h-5 w-5 text-[#e0b65f]" />
-              <div><p className="font-semibold text-white">Accuracy mode</p><p className="text-xs text-slate-400">One page at a time · 20 MB maximum</p></div>
+              <div><p className="font-semibold text-white">Accuracy mode</p><p className="text-xs text-slate-400">One page at a time · up to 512 MB</p></div>
             </div>
           </div>
         </div>
@@ -198,6 +227,7 @@ export default function PdfTranslator2Client() {
                 <button key={filter.key} type="button" onClick={() => setHistoryFilter(filter.key)} aria-pressed={historyFilter === filter.key} className={`rounded-full px-3 py-1.5 text-xs font-semibold transition ${historyFilter === filter.key ? 'bg-[#132a33] text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>{filter.label}</button>
               ))}
             </div>
+            {deleteError && <p role="alert" className="mt-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-semibold text-red-800">{deleteError}</p>}
           </div>
           <div className="divide-y divide-slate-100">
             {historyLoading && history.length === 0 && <div className="grid min-h-72 place-items-center text-sm text-slate-400"><LoaderCircle className="h-6 w-6 animate-spin" /><span className="sr-only">Loading translation history</span></div>}
@@ -207,7 +237,15 @@ export default function PdfTranslator2Client() {
             {!historyLoading && !historyError && visibleHistory.length === 0 && (
               <div className="grid min-h-72 place-items-center px-6 text-center"><div><FileText className="mx-auto h-8 w-8 text-slate-300" /><p className="mt-3 text-sm font-semibold text-slate-600">No matching translations</p><p className="mt-1 text-xs text-slate-400">New jobs will appear here automatically.</p></div></div>
             )}
-            {visibleHistory.map((item) => <HistoryRow key={item.id} item={item} />)}
+            {visibleHistory.map((item) => (
+              <HistoryRow
+                key={item.id}
+                item={item}
+                deleting={deletingId === item.id}
+                deleteDisabled={deletingId !== null}
+                onDelete={() => void deleteTranslation(item)}
+              />
+            ))}
           </div>
         </section>
       </div>
@@ -215,24 +253,51 @@ export default function PdfTranslator2Client() {
   );
 }
 
-function HistoryRow({ item }: { item: HistoryItem }) {
+function HistoryRow({
+  item,
+  deleting,
+  deleteDisabled,
+  onDelete,
+}: {
+  item: HistoryItem;
+  deleting: boolean;
+  deleteDisabled: boolean;
+  onDelete: () => void;
+}) {
   const isActive = ACTIVE_STATUSES.has(item.status);
   return (
-    <Link href={`/esg/tools/pdf-translator-2/${item.id}`} className="group block px-5 py-4 transition hover:bg-[#fffaf0] sm:px-6">
-      <div className="flex items-start gap-4">
-        <div className={`mt-0.5 grid h-10 w-10 shrink-0 place-items-center rounded-xl ${item.status === 'completed' ? 'bg-emerald-50 text-emerald-700' : ATTENTION_STATUSES.has(item.status) ? 'bg-red-50 text-red-700' : 'bg-amber-50 text-amber-700'}`}>
-          {item.status === 'completed' ? <CheckCircle2 className="h-5 w-5" /> : isActive ? <LoaderCircle className={`h-5 w-5 ${item.status === 'processing' ? 'animate-spin' : ''}`} /> : <X className="h-5 w-5" />}
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-start justify-between gap-2">
-            <div className="min-w-0"><p className="truncate text-sm font-bold text-slate-900">{item.filename}</p><p className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500"><span>{item.total_pages || '—'} pages</span><span aria-hidden="true">·</span><span>{item.target_lang}</span><span aria-hidden="true">·</span><span className="inline-flex items-center gap-1"><Clock className="h-3 w-3" />{formatHistoryDate(item.created_at)}</span></p></div>
-            <div className="flex items-center gap-2"><StatusPill status={item.status} /><ArrowRight className="h-4 w-4 text-slate-300 transition group-hover:translate-x-0.5 group-hover:text-[#9a6718]" /></div>
+    <div className="group relative transition hover:bg-[#fffaf0]">
+      <Link
+        href={`/esg/tools/pdf-translator-2/${item.id}`}
+        className={`block py-4 pl-5 sm:pl-6 ${isActive ? 'pr-5 sm:pr-6' : 'pr-16 sm:pr-20'}`}
+      >
+        <div className="flex items-start gap-4">
+          <div className={`mt-0.5 grid h-10 w-10 shrink-0 place-items-center rounded-xl ${item.status === 'completed' ? 'bg-emerald-50 text-emerald-700' : ATTENTION_STATUSES.has(item.status) ? 'bg-red-50 text-red-700' : 'bg-amber-50 text-amber-700'}`}>
+            {item.status === 'completed' ? <CheckCircle2 className="h-5 w-5" /> : isActive ? <LoaderCircle className={`h-5 w-5 ${item.status === 'processing' ? 'animate-spin' : ''}`} /> : <X className="h-5 w-5" />}
           </div>
-          {isActive && <div className="mt-3 flex items-center gap-3"><div className="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-100"><div className="h-full rounded-full bg-amber-500 transition-all" style={{ width: `${Math.max(0, Math.min(100, item.progress))}%` }} /></div><span className="w-8 text-right font-mono text-[11px] font-bold text-slate-500">{item.progress}%</span></div>}
-          {ATTENTION_STATUSES.has(item.status) && item.message && <p className="mt-2 line-clamp-1 text-xs text-red-700">{item.message}</p>}
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div className="min-w-0"><p className="truncate text-sm font-bold text-slate-900">{item.filename}</p><p className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500"><span>{item.total_pages || '—'} pages</span><span aria-hidden="true">·</span><span>{item.target_lang}</span><span aria-hidden="true">·</span><span className="inline-flex items-center gap-1"><Clock className="h-3 w-3" />{formatHistoryDate(item.created_at)}</span></p></div>
+              <div className="flex items-center gap-2"><StatusPill status={item.status} /><ArrowRight className="h-4 w-4 text-slate-300 transition group-hover:translate-x-0.5 group-hover:text-[#9a6718]" /></div>
+            </div>
+            {isActive && <div className="mt-3 flex items-center gap-3"><div className="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-100"><div className="h-full rounded-full bg-amber-500 transition-all" style={{ width: `${Math.max(0, Math.min(100, item.progress))}%` }} /></div><span className="w-8 text-right font-mono text-[11px] font-bold text-slate-500">{item.progress}%</span></div>}
+            {ATTENTION_STATUSES.has(item.status) && item.message && <p className="mt-2 line-clamp-1 text-xs text-red-700">{item.message}</p>}
+          </div>
         </div>
-      </div>
-    </Link>
+      </Link>
+      {!isActive && (
+        <button
+          type="button"
+          onClick={onDelete}
+          disabled={deleteDisabled}
+          aria-label={`Delete translation ${item.filename}`}
+          title="Delete translation"
+          className="absolute right-4 top-1/2 grid h-9 w-9 -translate-y-1/2 place-items-center rounded-lg border border-transparent text-slate-400 transition hover:border-red-200 hover:bg-red-50 hover:text-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-45 sm:right-5"
+        >
+          {deleting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+        </button>
+      )}
+    </div>
   );
 }
 

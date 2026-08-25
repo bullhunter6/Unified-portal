@@ -1,7 +1,42 @@
-export const MAX_PDF_UPLOAD_BYTES = 20 * 1024 * 1024;
-export const MAX_PDF_MULTIPART_OVERHEAD_BYTES = 1024 * 1024;
+// Match the largest individual file accepted by OpenAI's file platform. The
+// Translator splits the source locally and submits one page at a time, so the
+// source document itself is never sent to a model as one 512 MB request.
+export const MAX_PDF_UPLOAD_BYTES = 512 * 1024 * 1024;
+export const MAX_PDF_MULTIPART_OVERHEAD_BYTES = 4 * 1024 * 1024;
 export const MAX_PDF_REQUEST_BYTES =
   MAX_PDF_UPLOAD_BYTES + MAX_PDF_MULTIPART_OVERHEAD_BYTES;
+
+// PDF Translator v2 is deliberately pinned to Luna for every OpenAI pass. Do
+// not make this an environment override: stale worker settings must never
+// select any other model for extraction, translation, review, or retries.
+export const PDFX_V2_MODEL = 'gpt-5.6-luna' as const;
+export const PDFX_V2_RENDERER_VERSION = 'clean-layout-v1-2026-08-25' as const;
+
+// Checkpoints created by older geometry/rendering rules must not be mixed with
+// pages created by this pipeline. Bump this whenever the stored layout contract
+// changes in a way that requires re-extraction.
+export const PDFX_V2_PIPELINE_VERSION = 'luna-layout-v5-2026-08-25' as const;
+
+// New submissions use a queue type unknown to pre-layout-preservation workers.
+// Keeping the domain/API name as v2 avoids a database migration, while the v4
+// queue fence guarantees that an obsolete worker cannot claim and complete a
+// new translation with the removed reflow renderer or a non-Luna model.
+export const PDFX_V2_QUEUE_JOB_TYPE = 'pdf_translation_v5' as const;
+export const PDFX_V2_LEGACY_QUEUE_JOB_TYPES = [
+  'pdf_translation_v4',
+  'pdf_translation_v3',
+  'pdf_translation_v2',
+] as const;
+export const PDFX_V2_QUEUE_JOB_TYPES = [
+  PDFX_V2_QUEUE_JOB_TYPE,
+  ...PDFX_V2_LEGACY_QUEUE_JOB_TYPES,
+] as const;
+
+export type PdfxV2QueueJobType = (typeof PDFX_V2_QUEUE_JOB_TYPES)[number];
+
+export function isPdfxV2QueueJobType(value: string): value is PdfxV2QueueJobType {
+  return (PDFX_V2_QUEUE_JOB_TYPES as readonly string[]).includes(value);
+}
 
 export function buildPdfContentDisposition(
   disposition: 'attachment' | 'inline',

@@ -4,17 +4,25 @@ import bidiFactory from 'bidi-js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { segmentPdfText } from './structured-text';
+import type { PdfElement, PdfPageLayout } from './schemas';
+import { listTextWithMarkers } from './serialize';
 import type { SourcePageMapping, TranslatedPdfResult } from './types';
+import { PdfxV2ValidationError, validateExtractedPage } from './validation';
 
-type PageBlock = { pageNumber: number; text: string };
-
-const A4 = { w: 595.28, h: 841.89 };
-const MARGIN = 48;
-const TABLE_CELL_PADDING = 4;
-const TABLE_BORDER_WIDTH = 0.65;
+const NORMALIZED_PAGE_SIZE = 1000;
+const MIN_FONT_SIZE = 1.5;
 const ARABIC_CHARACTER = /[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff\ufb50-\ufdff\ufe70-\ufeff]/g;
+const NUMERIC_TEXT = /^[\s\d.,:%/()+\-–—]+$/;
+const VISUAL_KINDS = new Set<PdfElement['kind']>([
+  'image',
+  'stamp',
+  'signature',
+  'other',
+]);
 const bidi = bidiFactory();
+
+type TextAlignment = 'left' | 'center' | 'right';
+type PdfBox = { x: number; y: number; width: number; height: number };
 
 export function normalizePdfText(input: string): string {
   return (input ?? '')
@@ -31,16 +39,10 @@ function isRtlLine(text: string): boolean {
   return ARABIC_CHARACTER.test(text);
 }
 
-/**
- * Fontkit shapes an Arabic line as one RTL run and reverses every glyph in it,
- * including embedded LTR runs such as Western digits. Preorder the logical text
- * with the Unicode bidi algorithm so Fontkit's final reversal yields the proper
- * visual order without turning `10` into `01`.
- */
+/** Preorder mixed-direction text so Fontkit's RTL shaping keeps LTR numbers intact. */
 export function prepareRtlLineForPdf(text: string): string {
   const embedding = bidi.getEmbeddingLevels(text, 'rtl');
   const characters = text.split('');
-
   bidi.getMirroredCharactersMap(text, embedding).forEach((replacement, index) => {
     characters[index] = replacement;
   });
@@ -51,7 +53,6 @@ export function prepareRtlLineForPdf(text: string): string {
       characters[right] = character;
     }
   }
-
   return Array.from(characters.join('')).reverse().join('');
 }
 
@@ -65,7 +66,6 @@ function wrapLogicalLine(
   const output: string[] = [];
   const words = logicalLine.trim().split(/\s+/g);
   let line = '';
-
   for (const word of words) {
     const candidate = line ? `${line} ${word}` : word;
     if (font.widthOfTextAtSize(candidate, fontSize) <= maxWidth) {
@@ -77,14 +77,10 @@ function wrapLogicalLine(
       line = word;
       continue;
     }
-
     let fragment = '';
     for (const character of Array.from(word)) {
       const candidateFragment = fragment + character;
-      if (
-        fragment &&
-        font.widthOfTextAtSize(candidateFragment, fontSize) > maxWidth
-      ) {
+      if (fragment && font.widthOfTextAtSize(candidateFragment, fontSize) > maxWidth) {
         output.push(fragment);
         fragment = character;
       } else {
@@ -108,78 +104,189 @@ export function wrapLines(
     .flatMap((line) => wrapLogicalLine(line, maxWidth, font, fontSize));
 }
 
-function measureTableColumnWidths(
-  rows: readonly string[][],
-  columnCount: number,
-  usableWidth: number,
-  font: PDFFont,
-  fontSize: number,
-): number[] {
-  const equalWidth = usableWidth / columnCount;
-  const minimumWidth = Math.min(52, equalWidth);
-  const preferred = Array.from({ length: columnCount }, (_, columnIndex) => {
-    let width = minimumWidth;
-    for (const row of rows) {
-      width = Math.max(
-        width,
-        font.widthOfTextAtSize(normalizePdfText(row[columnIndex] || ''), fontSize) +
-          TABLE_CELL_PADDING * 2,
-      );
-    }
-    return Math.min(width, usableWidth * 0.65);
-  });
-
-  const reserved = minimumWidth * columnCount;
-  const distributable = Math.max(0, usableWidth - reserved);
-  const desiredExtra = preferred.map((width) => Math.max(0, width - minimumWidth));
-  const totalExtra = desiredExtra.reduce((sum, width) => sum + width, 0);
-  if (totalExtra === 0) return Array(columnCount).fill(equalWidth);
-
-  return desiredExtra.map(
-    (extra) => minimumWidth + distributable * (extra / totalExtra),
-  );
+function boxFromNormalized(page: PDFPage, bbox: readonly number[]): PdfBox {
+  const size = page.getSize();
+  const left = Math.max(0, Math.min(NORMALIZED_PAGE_SIZE, bbox[0] ?? 0));
+  const top = Math.max(0, Math.min(NORMALIZED_PAGE_SIZE, bbox[1] ?? 0));
+  const right = Math.max(left, Math.min(NORMALIZED_PAGE_SIZE, bbox[2] ?? left));
+  const bottom = Math.max(top, Math.min(NORMALIZED_PAGE_SIZE, bbox[3] ?? top));
+  return {
+    x: (left / NORMALIZED_PAGE_SIZE) * size.width,
+    y: size.height - (bottom / NORMALIZED_PAGE_SIZE) * size.height,
+    width: ((right - left) / NORMALIZED_PAGE_SIZE) * size.width,
+    height: ((bottom - top) / NORMALIZED_PAGE_SIZE) * size.height,
+  };
 }
 
-function drawPdfLine(
-  page: PDFPage,
+function insetBox(box: PdfBox, horizontal: number, vertical = horizontal): PdfBox {
+  const safeHorizontal = Math.max(0, Math.min(horizontal, box.width / 3));
+  const safeVertical = Math.max(0, Math.min(vertical, box.height / 3));
+  return {
+    x: box.x + safeHorizontal,
+    y: box.y + safeVertical,
+    width: Math.max(0, box.width - safeHorizontal * 2),
+    height: Math.max(0, box.height - safeVertical * 2),
+  };
+}
+
+function alignedX(
   line: string,
-  x: number,
-  y: number,
-  maxWidth: number,
+  box: PdfBox,
   font: PDFFont,
   fontSize: number,
+  alignment: TextAlignment,
+): number {
+  const rendered = isRtlLine(line) ? prepareRtlLineForPdf(line) : line;
+  const width = font.widthOfTextAtSize(rendered, fontSize);
+  if (isRtlLine(line) || alignment === 'right') return Math.max(box.x, box.x + box.width - width);
+  if (alignment === 'center') return Math.max(box.x, box.x + (box.width - width) / 2);
+  return box.x;
+}
+
+function drawLine(
+  page: PDFPage,
+  line: string,
+  box: PdfBox,
+  y: number,
+  font: PDFFont,
+  fontSize: number,
+  alignment: TextAlignment,
 ): void {
   if (!line) return;
-  const rtl = isRtlLine(line);
-  const renderedLine = rtl ? prepareRtlLineForPdf(line) : line;
-  const lineWidth = font.widthOfTextAtSize(renderedLine, fontSize);
-  page.drawText(renderedLine, {
-    x: rtl ? Math.max(x, x + maxWidth - lineWidth) : x,
+  const rendered = isRtlLine(line) ? prepareRtlLineForPdf(line) : line;
+  page.drawText(rendered, {
+    x: alignedX(line, box, font, fontSize, alignment),
     y,
     size: fontSize,
     font,
+    color: rgb(0.06, 0.06, 0.06),
   });
 }
 
-function drawHeader(
-  page: PDFPage,
-  sourcePageNumber: number,
-  continuation: boolean,
+function fitText(
+  text: string,
+  box: PdfBox,
   font: PDFFont,
-  pageHeight: number,
-  margin: number,
-): number {
-  const label = continuation
-    ? `Source page ${sourcePageNumber} (continued)`
-    : `Source page ${sourcePageNumber}`;
-  page.drawText(label, {
-    x: margin,
-    y: pageHeight - margin,
-    size: 10,
+  maximumFontSize: number,
+  minimumFontSize = MIN_FONT_SIZE,
+  lineHeightMultiplier = 1.18,
+): { fontSize: number; lineHeight: number; lines: string[] } {
+  const maximum = Math.max(minimumFontSize, Math.min(maximumFontSize, box.height * 0.82));
+  for (let fontSize = maximum; fontSize >= minimumFontSize; fontSize -= 0.25) {
+    const lines = wrapLines(text, Math.max(1, box.width), font, fontSize);
+    const lineHeight = fontSize * lineHeightMultiplier;
+    if (lines.length * lineHeight <= box.height + 0.1) {
+      return { fontSize, lineHeight, lines };
+    }
+  }
+  const lines = wrapLines(text, Math.max(1, box.width), font, minimumFontSize);
+  return { fontSize: minimumFontSize, lineHeight: minimumFontSize * lineHeightMultiplier, lines };
+}
+
+function drawTextInBox(args: {
+  page: PDFPage;
+  text: string;
+  box: PdfBox;
+  font: PDFFont;
+  maximumFontSize: number;
+  minimumFontSize?: number;
+  padding: number;
+  alignment?: TextAlignment;
+  verticallyCentered?: boolean;
+  lineHeightMultiplier?: number;
+}): void {
+  const contentBox = insetBox(args.box, args.padding, Math.min(args.padding, 0.15));
+  const text = normalizePdfText(args.text);
+  if (!text || contentBox.width <= 0 || contentBox.height <= 0) return;
+  const fitted = fitText(
+    text,
+    contentBox,
+    args.font,
+    args.maximumFontSize,
+    args.minimumFontSize,
+    args.lineHeightMultiplier,
+  );
+  const visibleLineCount = Math.max(0, Math.floor(contentBox.height / fitted.lineHeight));
+  const lines = fitted.lines.slice(0, visibleLineCount);
+  const renderedHeight = lines.length * fitted.lineHeight;
+  const topOffset = args.verticallyCentered
+    ? Math.max(0, (contentBox.height - renderedHeight) / 2)
+    : 0;
+  let y = contentBox.y + contentBox.height - topOffset - fitted.fontSize;
+  for (const line of lines) {
+    drawLine(
+      args.page,
+      line,
+      contentBox,
+      y,
+      args.font,
+      fitted.fontSize,
+      args.alignment ?? 'left',
+    );
+    y -= fitted.lineHeight;
+  }
+}
+
+function elementFontSize(element: PdfElement): number {
+  if (element.kind === 'heading') return element.level <= 1 ? 18 : 14;
+  if (element.kind === 'header' || element.kind === 'footer') return 9.5;
+  return 11;
+}
+
+function drawTable(page: PDFPage, element: PdfElement, font: PDFFont): void {
+  for (const row of [...element.rows].sort((left, right) => left.rowIndex - right.rowIndex)) {
+    for (const cell of [...row.cells].sort(
+      (left, right) => left.columnIndex - right.columnIndex,
+    )) {
+      const cellBox = boxFromNormalized(page, cell.bbox);
+      page.drawRectangle({
+        x: cellBox.x,
+        y: cellBox.y,
+        width: cellBox.width,
+        height: cellBox.height,
+        color: cell.isHeader ? rgb(0.945, 0.961, 0.976) : rgb(1, 1, 1),
+        borderColor: rgb(0.392, 0.455, 0.545),
+        borderWidth: 0.55,
+      });
+      const alignment: TextAlignment = cell.isHeader
+        ? 'center'
+        : NUMERIC_TEXT.test(cell.text)
+          ? 'right'
+          : 'left';
+      drawTextInBox({
+        page,
+        text: cell.text,
+        box: cellBox,
+        font,
+        maximumFontSize: cell.isHeader ? 8.5 : 9,
+        minimumFontSize: 1.4,
+        padding: Math.min(0.8, cellBox.width * 0.04),
+        alignment,
+        verticallyCentered: cell.isHeader,
+        lineHeightMultiplier: 1.12,
+      });
+    }
+  }
+}
+
+function drawTranslatedElement(page: PDFPage, element: PdfElement, font: PDFFont): void {
+  if (element.kind === 'table') {
+    drawTable(page, element, font);
+    return;
+  }
+  if (VISUAL_KINDS.has(element.kind)) return;
+  const text = element.kind === 'list' ? listTextWithMarkers(element.text) : element.text;
+  drawTextInBox({
+    page,
+    text,
+    box: boxFromNormalized(page, element.bbox),
     font,
-    color: rgb(0.2, 0.2, 0.2),
+    maximumFontSize: elementFontSize(element),
+    minimumFontSize: 1.5,
+    padding: 0.8,
+    alignment: element.kind === 'heading' ? 'center' : 'left',
+    verticallyCentered: element.kind === 'heading',
   });
-  return pageHeight - margin - 18;
 }
 
 async function resolveFontPath(): Promise<string> {
@@ -200,180 +307,70 @@ async function resolveFontPath(): Promise<string> {
   throw new Error('PDF translation font DejaVuSans.ttf is missing');
 }
 
+export type TranslatedPdfBytesResult = {
+  bytes: Buffer;
+  pageMap: SourcePageMapping[];
+};
+
+/** Build translated PDF bytes on clean pages, matching PdfLayoutCanvas. */
+export async function makeTranslatedPdfBytes(
+  pages: readonly PdfPageLayout[],
+  sourcePdf: Buffer,
+  title = 'Translated Document',
+): Promise<TranslatedPdfBytesResult> {
+  const source = await PDFDocument.load(sourcePdf, { updateMetadata: false });
+  const highestPage = pages.reduce((maximum, page) => Math.max(maximum, page.pageNumber), 0);
+  if (highestPage > source.getPageCount()) {
+    throw new Error('Translated page layout references a source page that does not exist');
+  }
+  const output = await PDFDocument.create();
+  output.registerFontkit(fontkit);
+  output.setTitle(title);
+  output.setSubject('Clean geometry-preserving translated text layout');
+  const fontBytes = await fs.readFile(await resolveFontPath());
+  const font = await output.embedFont(fontBytes, { subset: true });
+  const pageMap: SourcePageMapping[] = [];
+
+  for (const layout of [...pages].sort((left, right) => left.pageNumber - right.pageNumber)) {
+    const validation = validateExtractedPage(layout, layout.pageNumber);
+    if (!validation.valid) {
+      throw new PdfxV2ValidationError(
+        `Refusing to render unsafe page ${layout.pageNumber} geometry: ${validation.failures.join('; ')}`,
+      );
+    }
+    const sourceSize = source.getPage(layout.pageNumber - 1).getSize();
+    const page = output.addPage([sourceSize.width, sourceSize.height]);
+    page.drawRectangle({
+      x: 0,
+      y: 0,
+      width: sourceSize.width,
+      height: sourceSize.height,
+      color: rgb(1, 1, 1),
+    });
+    for (const element of [...layout.elements].sort(
+      (left, right) => left.order - right.order || left.id.localeCompare(right.id),
+    )) {
+      drawTranslatedElement(page, element, font);
+    }
+    pageMap.push({
+      sourcePageNumber: layout.pageNumber,
+      outputPageNumbers: [output.getPageCount()],
+    });
+  }
+
+  const bytes = Buffer.from(await output.save());
+  return { bytes, pageMap };
+}
+
+/** Render the translated layout onto clean pages, matching PdfLayoutCanvas. */
 export async function makeTranslatedPdf(
-  pages: PageBlock[],
+  pages: readonly PdfPageLayout[],
+  sourcePdf: Buffer,
   outPath: string,
   title = 'Translated Document',
 ): Promise<TranslatedPdfResult> {
   await fs.mkdir(path.dirname(outPath), { recursive: true });
-  const fontBytes = await fs.readFile(await resolveFontPath());
-  const pdf = await PDFDocument.create();
-  pdf.registerFontkit(fontkit);
-  pdf.setTitle(title);
-  pdf.setSubject('Text translation with explicit source-page mapping');
-
-  const font = await pdf.embedFont(fontBytes, { subset: true });
-  const lineGap = 4;
-  const pageMap: SourcePageMapping[] = [];
-
-  for (const source of [...pages].sort((a, b) => a.pageNumber - b.pageNumber)) {
-    const mapping: SourcePageMapping = {
-      sourcePageNumber: source.pageNumber,
-      outputPageNumbers: [],
-    };
-    pageMap.push(mapping);
-
-    const safeText = normalizePdfText(source.text || '') || '[No translated text]';
-    const segments = segmentPdfText(safeText);
-    const maximumTableColumns = segments.reduce(
-      (maximum, segment) => segment.kind === 'table'
-        ? Math.max(maximum, segment.columnCount)
-        : maximum,
-      0,
-    );
-    const useLandscape = maximumTableColumns >= 6;
-    const pageSize = useLandscape ? { w: A4.h, h: A4.w } : A4;
-    const margin = useLandscape ? 30 : MARGIN;
-    const proseFontSize = useLandscape ? 10 : 11;
-    const proseLineHeight = proseFontSize + lineGap;
-    const tableFontSize = useLandscape
-      ? Math.max(6, 9 - Math.max(0, maximumTableColumns - 8) * 0.45)
-      : proseFontSize;
-    const tableLineHeight = tableFontSize + (useLandscape ? 2.5 : lineGap);
-    const usableWidth = pageSize.w - margin * 2;
-
-    let outputPage = pdf.addPage([pageSize.w, pageSize.h]);
-    mapping.outputPageNumbers.push(pdf.getPageCount());
-    let y = drawHeader(
-      outputPage,
-      source.pageNumber,
-      false,
-      font,
-      pageSize.h,
-      margin,
-    );
-
-    const addContinuationPage = () => {
-      outputPage = pdf.addPage([pageSize.w, pageSize.h]);
-      mapping.outputPageNumbers.push(pdf.getPageCount());
-      y = drawHeader(
-        outputPage,
-        source.pageNumber,
-        true,
-        font,
-        pageSize.h,
-        margin,
-      );
-    };
-
-    for (const segment of segments) {
-      if (segment.kind === 'text') {
-        const lines = wrapLines(segment.text, usableWidth, font, proseFontSize);
-        for (const line of lines) {
-          if (y < margin + proseFontSize) addContinuationPage();
-          if (!line) {
-            y -= proseLineHeight;
-            continue;
-          }
-
-          drawPdfLine(
-            outputPage,
-            line,
-            margin,
-            y,
-            usableWidth,
-            font,
-            proseFontSize,
-          );
-          y -= proseLineHeight;
-        }
-        continue;
-      }
-
-      const columnWidths = measureTableColumnWidths(
-        segment.rows,
-        segment.columnCount,
-        usableWidth,
-        font,
-        tableFontSize,
-      );
-      const maximumFreshPageHeight =
-        pageSize.h - margin - 18 - margin;
-
-      for (const row of segment.rows) {
-        const cellLines = row.map((cell, columnIndex) => {
-          const wrapped = wrapLines(
-            cell,
-            Math.max(4, columnWidths[columnIndex] - TABLE_CELL_PADDING * 2),
-            font,
-            tableFontSize,
-          );
-          return wrapped.length > 0 ? wrapped : [''];
-        });
-        const totalLines = Math.max(...cellLines.map((lines) => lines.length), 1);
-        const fullRowHeight = totalLines * tableLineHeight + TABLE_CELL_PADDING * 2;
-        if (
-          fullRowHeight <= maximumFreshPageHeight &&
-          fullRowHeight > y - margin
-        ) {
-          addContinuationPage();
-        }
-
-        let lineOffset = 0;
-        while (lineOffset < totalLines) {
-          const availableHeight = y - margin;
-          const availableLines = Math.floor(
-            (availableHeight - TABLE_CELL_PADDING * 2) / tableLineHeight,
-          );
-          if (availableLines < 1) {
-            addContinuationPage();
-            continue;
-          }
-
-          const lineCount = Math.min(totalLines - lineOffset, availableLines);
-          const rowHeight = lineCount * tableLineHeight + TABLE_CELL_PADDING * 2;
-          let x = margin;
-          for (let columnIndex = 0; columnIndex < segment.columnCount; columnIndex += 1) {
-            const columnWidth = columnWidths[columnIndex];
-            outputPage.drawRectangle({
-              x,
-              y: y - rowHeight,
-              width: columnWidth,
-              height: rowHeight,
-              borderColor: rgb(0.35, 0.35, 0.35),
-              borderWidth: TABLE_BORDER_WIDTH,
-            });
-
-            const renderedLines = cellLines[columnIndex].slice(
-              lineOffset,
-              lineOffset + lineCount,
-            );
-            for (let cellLineIndex = 0; cellLineIndex < renderedLines.length; cellLineIndex += 1) {
-              drawPdfLine(
-                outputPage,
-                renderedLines[cellLineIndex],
-                x + TABLE_CELL_PADDING,
-                y - TABLE_CELL_PADDING - tableFontSize - cellLineIndex * tableLineHeight,
-                columnWidth - TABLE_CELL_PADDING * 2,
-                font,
-                tableFontSize,
-              );
-            }
-            x += columnWidth;
-          }
-          y -= rowHeight;
-          lineOffset += lineCount;
-          if (lineOffset < totalLines) addContinuationPage();
-        }
-      }
-      // Prose is drawn from its baseline, so reserve a full line after the
-      // table rather than only padding; this keeps glyph ascenders clear of
-      // the final border on both the same page and a continuation page.
-      y -= proseLineHeight;
-    }
-  }
-
-  const bytes = await pdf.save();
-  await fs.writeFile(outPath, Buffer.from(bytes));
+  const { bytes, pageMap } = await makeTranslatedPdfBytes(pages, sourcePdf, title);
+  await fs.writeFile(outPath, bytes);
   return { outputPath: outPath, pageMap };
 }

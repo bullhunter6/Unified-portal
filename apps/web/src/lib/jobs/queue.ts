@@ -3,6 +3,9 @@ import { esgPrisma } from "@esgcredit/db-esg";
 
 export const BACKGROUND_JOB_TYPES = [
   "pdf_translation_v2",
+  "pdf_translation_v3",
+  "pdf_translation_v4",
+  "pdf_translation_v5",
   "esg_workbook",
   "fitch_workbook",
   "esg_driver",
@@ -401,6 +404,7 @@ export async function completePdfTranslationV2Job(
   userId: number,
   leaseOwner: string,
   args: {
+    jobType: Extract<BackgroundJobType, "pdf_translation_v2" | "pdf_translation_v3" | "pdf_translation_v4" | "pdf_translation_v5">;
     outputPdf: Buffer;
     metrics: unknown;
     result: unknown;
@@ -416,7 +420,7 @@ export async function completePdfTranslationV2Job(
       SELECT id
       FROM background_jobs
       WHERE id = ${id}::uuid
-        AND job_type = 'pdf_translation_v2'
+        AND job_type = ${args.jobType}
         AND user_id = ${userId}
         AND status = 'processing'
         AND lease_owner = ${leaseOwner}
@@ -473,12 +477,19 @@ export async function completePdfTranslationV2Job(
 export async function failBackgroundJob(
   job: ClaimedBackgroundJob,
   error: string,
+  options: { minimumAttempts?: number; keepRetrying?: boolean } = {},
 ): Promise<BackgroundJobTransition> {
-  const retry = job.attempts < job.maxAttempts;
+  const effectiveMaxAttempts = Math.max(
+    job.maxAttempts,
+    Math.max(1, Math.floor(options.minimumAttempts ?? job.maxAttempts)),
+    options.keepRetrying ? job.attempts + 2 : 1,
+  );
+  const retry = job.attempts < effectiveMaxAttempts;
   const delaySeconds = Math.min(300, 5 * 2 ** Math.max(0, job.attempts - 1));
   const rows = await esgPrisma.$queryRaw<Array<{ status: BackgroundJobStatus }>>`
     UPDATE background_jobs
-    SET status = CASE
+    SET max_attempts = GREATEST(max_attempts, ${effectiveMaxAttempts}),
+        status = CASE
           WHEN cancel_requested THEN 'cancelled'
           WHEN ${retry} THEN 'queued'
           ELSE 'error'
@@ -571,7 +582,7 @@ export async function cleanupTerminalPdfJobBlobs(
   return esgPrisma.$executeRaw`
     UPDATE background_jobs
     SET input_data = NULL, output_data = NULL, updated_at = now()
-    WHERE job_type = 'pdf_translation_v2'
+    WHERE job_type IN ('pdf_translation_v2', 'pdf_translation_v3', 'pdf_translation_v4', 'pdf_translation_v5')
       AND status IN ('done', 'error', 'cancelled')
       AND completed_at < now() - (${retentionSeconds} * INTERVAL '1 second')
       AND (input_data IS NOT NULL OR output_data IS NOT NULL)
@@ -659,7 +670,12 @@ async function synchronizeReapedJobs(
           updated_at: new Date(),
         },
       });
-    } else if (job.job_type === "pdf_translation_v2") {
+    } else if (
+      job.job_type === "pdf_translation_v2" ||
+      job.job_type === "pdf_translation_v3" ||
+      job.job_type === "pdf_translation_v4" ||
+      job.job_type === "pdf_translation_v5"
+    ) {
       await esgPrisma.pdf_translation_v2_jobs.updateMany({
         where: {
           id: job.id,
@@ -736,7 +752,7 @@ export async function reconcileTerminalDomainJobs(): Promise<void> {
         updated_at = now()
     FROM background_jobs AS queue
     WHERE queue.id = domain.id
-      AND queue.job_type = 'pdf_translation_v2'
+      AND queue.job_type IN ('pdf_translation_v2', 'pdf_translation_v3', 'pdf_translation_v4', 'pdf_translation_v5')
       AND queue.status IN ('error', 'cancelled')
       AND domain.status IN ('queued', 'processing', 'cancelling')
   `;

@@ -13,12 +13,11 @@ import {
   EyeOff,
   FileText,
   Languages,
-  LoaderCircle,
   RotateCcw,
   StopCircle,
 } from 'lucide-react';
-import { PdfTextContent } from '@/components/pdfx-v2/PdfTextContent';
-
+import { PdfLayoutCanvas } from '@/components/pdfx-v2/PdfLayoutCanvas';
+import type { StoredPdfPageLayout } from '@/lib/pdfx-v2/schemas';
 type JobStatus = {
   id: string;
   filename: string;
@@ -38,12 +37,13 @@ type PageData = {
   status: string;
   originalText: string;
   translatedText: string;
+  sourceLayout: StoredPdfPageLayout | null;
+  translatedLayout: StoredPdfPageLayout | null;
   warnings: unknown;
 };
 
 type PaneKey = 'source' | 'original' | 'translated';
 type PaneVisibility = Record<PaneKey, boolean>;
-
 const ACTIVE = new Set(['queued', 'processing', 'cancelling']);
 const PANE_LABELS: Record<PaneKey, string> = {
   source: 'Source PDF',
@@ -67,7 +67,7 @@ export default function PdfTranslator2Job({ jobId }: { jobId: string }) {
   const refresh = useCallback(async () => {
     const [statusResponse, pagesResponse] = await Promise.all([
       fetch(`/api/pdfx-v2/status?jobId=${encodeURIComponent(jobId)}`, { cache: 'no-store' }),
-      fetch(`/api/pdfx-v2/pages?jobId=${encodeURIComponent(jobId)}`, { cache: 'no-store' }),
+      fetch(`/api/pdfx-v2/pages?jobId=${encodeURIComponent(jobId)}&page=${selectedPage}`, { cache: 'no-store' }),
     ]);
     const statusPayload = await statusResponse.json().catch(() => ({})) as { job?: JobStatus; error?: string };
     if (!statusResponse.ok || !statusPayload.job) throw new Error(statusPayload.error ?? 'Unable to load job');
@@ -77,7 +77,7 @@ export default function PdfTranslator2Job({ jobId }: { jobId: string }) {
       setPages(pagePayload.pages ?? []);
     }
     return statusPayload.job;
-  }, [jobId]);
+  }, [jobId, selectedPage]);
 
   useEffect(() => {
     let stopped = false;
@@ -176,8 +176,7 @@ export default function PdfTranslator2Job({ jobId }: { jobId: string }) {
                 <span>Page</span>
                 <select value={selectedPage} onChange={(event) => changePage(Number(event.target.value))} className="h-9 rounded-lg border border-slate-300 bg-white px-3 text-sm font-bold text-slate-900 outline-none focus:border-amber-600 focus:ring-2 focus:ring-amber-200">
                   {Array.from({ length: job?.totalPages ?? 0 }, (_, index) => index + 1).map((number) => {
-                    const item = pages.find((candidate) => candidate.pageNumber === number);
-                    return <option key={number} value={number}>{number}{item?.status === 'translated' ? ' · Ready' : ''}</option>;
+                    return <option key={number} value={number}>{number}</option>;
                   })}
                 </select>
                 <span>of {job?.totalPages || '—'}</span>
@@ -197,19 +196,42 @@ export default function PdfTranslator2Job({ jobId }: { jobId: string }) {
           {visiblePanes.source && (
             <section className="min-w-0 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
               <PaneHeader title="Source PDF" detail="Selected page" icon={<FileText className="h-4 w-4" />} collapseDisabled={visiblePaneCount === 1} onCollapse={() => togglePane('source')} />
-              <iframe title={`Original source PDF, page ${selectedPage}`} src={`/api/pdfx-v2/file?jobId=${encodeURIComponent(jobId)}&page=${selectedPage}#toolbar=0&navpanes=0&scrollbar=0&view=FitH`} className="h-[min(78vh,900px)] min-h-[560px] w-full bg-slate-200" />
+              <PagePreview
+                alt={`Original source PDF, page ${selectedPage}`}
+                src={previewUrl(jobId, selectedPage, 'source')}
+              />
             </section>
           )}
           {visiblePanes.original && (
-            <TextPane title="Original text" text={page?.originalText ?? ''} emptyLabel={isActive ? 'This page has not been read yet.' : 'No source text was captured.'} tone="original" collapseDisabled={visiblePaneCount === 1} onCollapse={() => togglePane('original')} />
+            <LayoutPane
+              title="Original text"
+              tone="original"
+              layout={page?.sourceLayout}
+              text={page?.originalText ?? ''}
+              emptyLabel={isActive ? 'This page has not been extracted yet.' : 'No original text was extracted.'}
+              collapseDisabled={visiblePaneCount === 1}
+              onCollapse={() => togglePane('original')}
+            />
           )}
           {visiblePanes.translated && (
-            <TextPane title={`Translated text · ${job?.targetLang ?? ''}`} text={page?.translatedText ?? ''} emptyLabel={isActive ? 'This page has not been translated yet.' : 'No translated text is available.'} tone="translated" collapseDisabled={visiblePaneCount === 1} onCollapse={() => togglePane('translated')} />
+            <LayoutPane
+              title={`Translated text · ${job?.targetLang ?? ''}`}
+              tone="translated"
+              layout={page?.translatedLayout}
+              text={page?.translatedText ?? ''}
+              emptyLabel={isActive ? 'This page has not been translated yet.' : 'No translated text is available.'}
+              collapseDisabled={visiblePaneCount === 1}
+              onCollapse={() => togglePane('translated')}
+            />
           )}
         </div>
       </div>
     </main>
   );
+}
+
+function previewUrl(jobId: string, pageNumber: number, document: 'source' | 'translated') {
+  return `/api/pdfx-v2/preview?jobId=${encodeURIComponent(jobId)}&page=${pageNumber}&document=${document}`;
 }
 
 function PaneToggle({ label, visible, disabled, onClick }: { label: string; visible: boolean; disabled: boolean; onClick: () => void }) {
@@ -229,16 +251,34 @@ function PaneHeader({ title, detail, icon, collapseDisabled, onCollapse }: { tit
   );
 }
 
-function TextPane({ title, text, emptyLabel, tone, collapseDisabled, onCollapse }: { title: string; text: string; emptyLabel: string; tone: 'original' | 'translated'; collapseDisabled: boolean; onCollapse: () => void }) {
+function LayoutPane({ title, tone, layout, text, emptyLabel, collapseDisabled, onCollapse }: { title: string; tone: 'original' | 'translated'; layout?: StoredPdfPageLayout | null; text: string; emptyLabel: string; collapseDisabled: boolean; onCollapse: () => void }) {
   return (
-    <section className="min-w-0 rounded-xl border border-slate-200 bg-white shadow-sm">
+    <section className="min-w-0 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
       <div className={`flex min-h-12 items-center justify-between gap-3 rounded-t-xl border-b px-4 ${tone === 'translated' ? 'border-amber-200 bg-amber-50' : 'border-slate-200 bg-slate-50'}`}>
         <div className="flex min-w-0 items-center gap-2 text-sm font-bold"><Languages className={`h-4 w-4 shrink-0 ${tone === 'translated' ? 'text-amber-700' : 'text-slate-500'}`} /><span className="truncate">{title}</span></div>
-        <button type="button" disabled={collapseDisabled} onClick={onCollapse} aria-label={`Collapse ${title}`} title={collapseDisabled ? 'Keep at least one panel visible' : `Collapse ${title}`} className="rounded-md p-1.5 text-slate-400 transition hover:bg-white hover:text-slate-800 disabled:cursor-not-allowed disabled:opacity-35"><EyeOff className="h-4 w-4" /></button>
+        <div className="flex items-center gap-1.5">
+          <span className="rounded-md border border-slate-200 bg-white px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-500">Layout</span>
+          <button type="button" disabled={collapseDisabled} onClick={onCollapse} aria-label={`Collapse ${title}`} title={collapseDisabled ? 'Keep at least one panel visible' : `Collapse ${title}`} className="rounded-md p-1.5 text-slate-400 transition hover:bg-white hover:text-slate-800 disabled:cursor-not-allowed disabled:opacity-35"><EyeOff className="h-4 w-4" /></button>
+        </div>
       </div>
-      <div className="p-5 sm:p-6" dir="auto">
-        <PdfTextContent text={text} label={title} emptyLabel={emptyLabel} fontSize={13} tone={tone} />
-      </div>
+      <PdfLayoutCanvas
+        emptyLabel={emptyLabel}
+        label={title}
+        layout={layout}
+        text={text}
+        variant={tone}
+      />
     </section>
+  );
+}
+
+function PagePreview({ src, alt }: { src: string; alt: string }) {
+  return (
+    <div className="bg-slate-200 p-2 sm:p-3">
+      {/* The browser uses the PNG's intrinsic page ratio. This avoids the
+          nested PDF-viewer scrollbars and shows the exact persisted page. */}
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img src={src} alt={alt} className="block h-auto w-full bg-white shadow-sm" />
+    </div>
   );
 }

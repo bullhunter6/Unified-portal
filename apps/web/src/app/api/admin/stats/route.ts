@@ -36,6 +36,7 @@ export async function GET(req: NextRequest) {
       recentUsers,
       emailStats,
       aiAssistantStatsRaw,
+      pdfTranslatorStatsRaw,
     ] = await Promise.all([
       // Total users
       esgPrisma.users.count(),
@@ -124,6 +125,19 @@ export async function GET(req: NextRequest) {
         FROM article_conversations
         WHERE created_at >= ${thirtyDaysAgo}
       `,
+      esgPrisma.$queryRaw<Array<{
+        total_jobs: bigint;
+        jobs_last_30_days: bigint;
+        total_pages: bigint;
+        unique_users: bigint;
+      }>>`
+        SELECT
+          COUNT(*)::bigint AS total_jobs,
+          COUNT(*) FILTER (WHERE created_at >= ${thirtyDaysAgo})::bigint AS jobs_last_30_days,
+          COALESCE(SUM(total_pages), 0)::bigint AS total_pages,
+          COUNT(DISTINCT user_id)::bigint AS unique_users
+        FROM pdf_translation_v2_jobs
+      `,
     ]);
 
     const activeUserIds = new Set<number>();
@@ -139,6 +153,13 @@ export async function GET(req: NextRequest) {
       activeSessions: Number(aiAssistantStatsResult?.active_sessions || 0),
       uniqueUsers: Number(aiAssistantStatsResult?.unique_users || 0),
       totalCost: Number(aiAssistantStatsResult?.total_cost || 0),
+    };
+    const pdfTranslatorStatsResult = pdfTranslatorStatsRaw[0];
+    const pdfTranslatorStats = {
+      totalJobs: Number(pdfTranslatorStatsResult?.total_jobs || 0),
+      jobsLast30Days: Number(pdfTranslatorStatsResult?.jobs_last_30_days || 0),
+      totalPages: Number(pdfTranslatorStatsResult?.total_pages || 0),
+      uniqueUsers: Number(pdfTranslatorStatsResult?.unique_users || 0),
     };
 
     // Process email stats
@@ -160,6 +181,7 @@ export async function GET(req: NextRequest) {
         failed: emailStatsMap['failed'] || 0,
       },
       aiAssistant: aiAssistantStats,
+      pdfTranslator: pdfTranslatorStats,
     });
   } catch (error: any) {
     console.error("Error fetching stats:", error);

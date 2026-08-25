@@ -1,8 +1,6 @@
 import path from 'node:path';
 export { MAX_PDF_UPLOAD_BYTES } from './constants';
 
-export const MAX_PDF_PAGES = 100;
-
 export function normalizePdfDisplayName(name: string, jobId: string): string {
   const leaf = path.posix.basename(String(name || '').replace(/\\/g, '/'));
   const cleaned = leaf
