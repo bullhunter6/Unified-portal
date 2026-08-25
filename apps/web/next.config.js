@@ -12,6 +12,7 @@ const nextConfig = {
     '@prisma/client',
     'prisma',
     'pdfjs-dist',
+    '@napi-rs/canvas',
     '@langchain/core',
     '@langchain/openai',
     'langchain',
