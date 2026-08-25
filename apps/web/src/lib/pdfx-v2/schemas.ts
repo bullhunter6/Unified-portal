@@ -12,6 +12,9 @@ export const PdfCellSchema = z.object({
   rowSpan: z.number().int().positive(),
   columnSpan: z.number().int().positive(),
   isHeader: z.boolean(),
+  // False means that this source text must be copied verbatim, never sent
+  // through translation. English and already-target-language cells use this.
+  translate: z.boolean(),
   text: z.string(),
   bbox: BBoxSchema,
 });
@@ -34,10 +37,15 @@ export const PdfElementSchema = z.object({
     'image',
     'stamp',
     'signature',
+    'suppressed_text',
     'other',
   ]),
   order: z.number().int().nonnegative(),
   level: z.number().int().nonnegative(),
+  // Extraction is also responsible for language routing. Keeping this flag in
+  // the stored layout makes "never translate English" deterministic in later
+  // retries, rendering, and resumed jobs.
+  translate: z.boolean(),
   text: z.string(),
   bbox: BBoxSchema,
   columnCount: z.number().int().nonnegative(),
@@ -47,8 +55,10 @@ export const PdfElementSchema = z.object({
 
 export const PdfPageLayoutSchema = z.object({
   pageNumber: z.number().int().positive(),
-  width: z.number().positive(),
-  height: z.number().positive(),
+  // Geometry is always expressed on this normalized square canvas. The worker
+  // records the source page's physical dimensions separately for rendering.
+  width: z.literal(1000),
+  height: z.literal(1000),
   orientation: z.enum(['portrait', 'landscape']),
   sourceLanguage: z.string(),
   sourceScript: z.string(),
@@ -97,6 +107,27 @@ export const PdfPageReviewSchema = z.object({
 });
 
 export type PdfPageLayout = z.infer<typeof PdfPageLayoutSchema>;
+export type StoredPdfPageLayout = PdfPageLayout & {
+  // Added by the worker from the source PDF, never guessed by the model.
+  // Bounding boxes remain normalized to 0..1000 on each axis.
+  pageWidthPoints?: number;
+  pageHeightPoints?: number;
+};
+
+export function parseStoredPdfPageLayout(value: unknown): StoredPdfPageLayout | null {
+  const parsed = PdfPageLayoutSchema.safeParse(value);
+  if (!parsed.success) return null;
+  const stored = value && typeof value === 'object'
+    ? value as { pageWidthPoints?: unknown; pageHeightPoints?: unknown }
+    : {};
+  const pageWidthPoints = Number(stored.pageWidthPoints);
+  const pageHeightPoints = Number(stored.pageHeightPoints);
+  return {
+    ...parsed.data,
+    ...(Number.isFinite(pageWidthPoints) && pageWidthPoints > 0 ? { pageWidthPoints } : {}),
+    ...(Number.isFinite(pageHeightPoints) && pageHeightPoints > 0 ? { pageHeightPoints } : {}),
+  };
+}
 export type PdfElement = z.infer<typeof PdfElementSchema>;
 export type PdfCell = z.infer<typeof PdfCellSchema>;
 export type DocumentContext = z.infer<typeof DocumentContextSchema>;

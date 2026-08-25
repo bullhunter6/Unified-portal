@@ -12,12 +12,12 @@ import {
   throwIfJobCancelled,
   updateBackgroundJobProgress,
 } from '@/lib/jobs/queue';
-import { MAX_PDF_PAGES } from './file-policy';
 import {
   DocumentContextSchema,
-  PdfPageLayoutSchema,
+  parseStoredPdfPageLayout,
   type DocumentContext,
   type PdfPageLayout,
+  type StoredPdfPageLayout,
 } from './schemas';
 import {
   buildDocumentContext,
@@ -27,13 +27,30 @@ import {
 import { renderPdfxV2Document } from './render';
 import { mergePageTranslation, pageLayoutToPlainText } from './serialize';
 import type { PdfxV2JobPayload, PdfxV2Stage } from './types';
+import {
+  isPdfxV2QueueJobType,
+  PDFX_V2_MODEL,
+  PDFX_V2_PIPELINE_VERSION,
+  PDFX_V2_QUEUE_JOB_TYPE,
+  PDFX_V2_RENDERER_VERSION,
+} from './constants';
 
 type StoredMetrics = {
+  requiredPipelineVersion?: string;
+  requiredModel?: string;
+  pipelineVersion?: string;
+  model?: string;
+  rendererVersion?: string;
   contextInputTokens?: number;
   contextOutputTokens?: number;
   contextModel?: string;
   contextResponseId?: string;
 };
+
+// Translation validation and transient OpenAI failures are recoverable from
+// page checkpoints. Keep retrying until the user cancels instead of turning a
+// difficult but valid document into a terminal error after three worker runs.
+export const PDF_TRANSLATION_MAX_ATTEMPTS = 1_000;
 
 function jsonValue(value: unknown): any {
   return JSON.parse(JSON.stringify(value));
@@ -43,31 +60,48 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function parseLayout(value: unknown): PdfPageLayout | null {
-  const parsed = PdfPageLayoutSchema.safeParse(value);
-  return parsed.success ? parsed.data : null;
-}
-
 function parseContext(value: unknown): DocumentContext | null {
   const parsed = DocumentContextSchema.safeParse(value);
   return parsed.success ? parsed.data : null;
 }
 
-async function splitPdfPages(input: Buffer): Promise<Buffer[]> {
+type SplitPdfPage = {
+  pdf: Buffer;
+  pageWidthPoints: number;
+  pageHeightPoints: number;
+};
+
+async function splitPdfPages(input: Buffer): Promise<SplitPdfPage[]> {
   const source = await PDFDocument.load(input, { updateMetadata: false });
   const count = source.getPageCount();
-  if (count < 1 || count > MAX_PDF_PAGES) {
-    throw new Error(`PDF page count must be between 1 and ${MAX_PDF_PAGES}`);
+  if (count < 1) {
+    throw new Error('PDF must contain at least one page');
   }
 
-  const pages: Buffer[] = [];
+  const pages: SplitPdfPage[] = [];
   for (let index = 0; index < count; index += 1) {
     const document = await PDFDocument.create();
     const [page] = await document.copyPages(source, [index]);
     document.addPage(page);
-    pages.push(Buffer.from(await document.save({ useObjectStreams: false })));
+    const size = source.getPage(index).getSize();
+    pages.push({
+      pdf: Buffer.from(await document.save({ useObjectStreams: false })),
+      pageWidthPoints: size.width,
+      pageHeightPoints: size.height,
+    });
   }
   return pages;
+}
+
+function withPhysicalPageSize(
+  layout: PdfPageLayout,
+  page: SplitPdfPage,
+): StoredPdfPageLayout {
+  return {
+    ...layout,
+    pageWidthPoints: page.pageWidthPoints,
+    pageHeightPoints: page.pageHeightPoints,
+  };
 }
 
 export async function startPdfTranslationV2Job(params: {
@@ -99,18 +133,24 @@ export async function startPdfTranslationV2Job(params: {
           progress: 0,
           total_pages: params.pageCount,
           current_page: 0,
-          metrics: {},
+          // Requirements are written by the web process. Actual pipeline/model
+          // fields are stamped only by the worker that really processed the
+          // job, so an old worker can never masquerade as the current build.
+          metrics: {
+            requiredPipelineVersion: PDFX_V2_PIPELINE_VERSION,
+            requiredModel: PDFX_V2_MODEL,
+          },
           input_pdf: params.inputBuffer,
         },
       }),
       esgPrisma.background_jobs.create({
         data: createBackgroundJobData({
           id: jobId,
-          jobType: 'pdf_translation_v2',
+          jobType: PDFX_V2_QUEUE_JOB_TYPE,
           userId: params.userId,
           payload,
           inputData: params.inputBuffer,
-          maxAttempts: 3,
+          maxAttempts: PDF_TRANSLATION_MAX_ATTEMPTS,
         }),
       }),
     ]);
@@ -124,6 +164,9 @@ export async function processPdfTranslationV2Job(
   job: ClaimedBackgroundJob<PdfxV2JobPayload>,
 ): Promise<{ queueCompleted: true; result: Record<string, unknown> }> {
   if (!job.inputData) throw new Error('PDF Translator input is missing');
+  if (!isPdfxV2QueueJobType(job.jobType)) {
+    throw new Error(`Unsupported PDF Translator queue type: ${job.jobType}`);
+  }
 
   const existing = await esgPrisma.pdf_translation_v2_jobs.findFirst({
     where: { id: job.id, user_id: job.userId },
@@ -138,6 +181,7 @@ export async function processPdfTranslationV2Job(
       translator: 'openai-structured-v2',
     };
     await completePdfTranslationV2Job(job.id, job.userId, job.leaseOwner, {
+      jobType: job.jobType,
       outputPdf: Buffer.from(existing.output_pdf),
       metrics: existing.metrics,
       result,
@@ -145,6 +189,20 @@ export async function processPdfTranslationV2Job(
     });
     return { queueCompleted: true, result };
   }
+
+  const priorMetrics = (existing.metrics && typeof existing.metrics === 'object'
+    ? existing.metrics
+    : {}) as StoredMetrics;
+  const checkpointCompatible =
+    priorMetrics.pipelineVersion === PDFX_V2_PIPELINE_VERSION &&
+    priorMetrics.model === PDFX_V2_MODEL;
+  let storedMetrics: StoredMetrics = {
+    ...(checkpointCompatible ? priorMetrics : {}),
+    requiredPipelineVersion: PDFX_V2_PIPELINE_VERSION,
+    requiredModel: PDFX_V2_MODEL,
+    pipelineVersion: PDFX_V2_PIPELINE_VERSION,
+    model: PDFX_V2_MODEL,
+  };
 
   const workDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'pdfx-v2-'));
   const outputPath = path.join(workDirectory, `${job.id}-translated.pdf`);
@@ -184,22 +242,42 @@ export async function processPdfTranslationV2Job(
 
   try {
     await reportProgress(3, 'extracting', 'Preparing PDF pages…');
+    if (!checkpointCompatible) {
+      // Never combine pages extracted by an older geometry contract or a
+      // different model with the current Luna-only output. This runs only for
+      // active jobs; completed historical translations remain untouched.
+      await esgPrisma.$transaction([
+        esgPrisma.pdf_translation_v2_pages.deleteMany({
+          where: { job_id: job.id },
+        }),
+        esgPrisma.pdf_translation_v2_jobs.updateMany({
+          where: { id: job.id, user_id: job.userId, status: 'processing' },
+          data: {
+            // Store an invalid/empty context sentinel. Prisma JSON fields use
+            // a special database-null type; parseContext deliberately rejects
+            // this value and rebuilds it on the next attempt if needed.
+            document_context: jsonValue({}),
+            metrics: jsonValue(storedMetrics),
+          },
+        }),
+      ]);
+    }
     const pagePdfs = await splitPdfPages(job.inputData);
     if (pagePdfs.length !== job.payload.pageCount) {
       throw new Error('Uploaded PDF page count changed during processing');
     }
 
     const persistedPages = new Map(
-      existing.pages.map((page) => [page.page_number, page]),
+      (checkpointCompatible ? existing.pages : []).map((page) => [page.page_number, page]),
     );
-    const sourceLayouts: PdfPageLayout[] = [];
+    const sourceLayouts: StoredPdfPageLayout[] = [];
 
     for (let index = 0; index < pagePdfs.length; index += 1) {
       const pageNumber = index + 1;
       const prior = persistedPages.get(pageNumber);
-      const storedLayout = parseLayout(prior?.source_layout);
+      const storedLayout = parseStoredPdfPageLayout(prior?.source_layout);
       if (storedLayout) {
-        sourceLayouts.push(storedLayout);
+        sourceLayouts.push(withPhysicalPageSize(storedLayout, pagePdfs[index]));
         continue;
       }
 
@@ -211,7 +289,11 @@ export async function processPdfTranslationV2Job(
       );
       let extracted: Awaited<ReturnType<typeof extractPageWithOpenAi>>;
       try {
-        extracted = await extractPageWithOpenAi(pagePdfs[index], pageNumber);
+        extracted = await extractPageWithOpenAi(
+          pagePdfs[index].pdf,
+          pageNumber,
+          job.payload.targetLang,
+        );
       } catch (error) {
         await esgPrisma.pdf_translation_v2_pages.upsert({
           where: { job_id_page_number: { job_id: job.id, page_number: pageNumber } },
@@ -230,39 +312,37 @@ export async function processPdfTranslationV2Job(
         throw error;
       }
       await throwIfJobCancelled(job.id, job.leaseOwner);
-      sourceLayouts.push(extracted.layout);
+      const extractedLayout = withPhysicalPageSize(extracted.layout, pagePdfs[index]);
+      sourceLayouts.push(extractedLayout);
       await esgPrisma.pdf_translation_v2_pages.upsert({
         where: { job_id_page_number: { job_id: job.id, page_number: pageNumber } },
         create: {
           job_id: job.id,
           page_number: pageNumber,
           status: 'extracted',
-          source_layout: jsonValue(extracted.layout),
-          source_text: pageLayoutToPlainText(extracted.layout),
+          source_layout: jsonValue(extractedLayout),
+          source_text: pageLayoutToPlainText(extractedLayout),
           extraction_model: extracted.model,
           extraction_attempts: extracted.attempts,
           input_tokens: extracted.inputTokens,
           output_tokens: extracted.outputTokens,
-          warnings: jsonValue(extracted.layout.warnings),
+          warnings: jsonValue(extractedLayout.warnings),
         },
         update: {
           status: 'extracted',
-          source_layout: jsonValue(extracted.layout),
-          source_text: pageLayoutToPlainText(extracted.layout),
+          source_layout: jsonValue(extractedLayout),
+          source_text: pageLayoutToPlainText(extractedLayout),
           extraction_model: extracted.model,
           extraction_attempts: extracted.attempts,
           input_tokens: extracted.inputTokens,
           output_tokens: extracted.outputTokens,
-          warnings: jsonValue(extracted.layout.warnings),
+          warnings: jsonValue(extractedLayout.warnings),
           error_message: null,
         },
       });
     }
 
-    let context = parseContext(existing.document_context);
-    let storedMetrics = (existing.metrics && typeof existing.metrics === 'object'
-      ? existing.metrics
-      : {}) as StoredMetrics;
+    let context = checkpointCompatible ? parseContext(existing.document_context) : null;
     if (!context) {
       await reportProgress(47, 'context', 'Building document terminology context…');
       const contextResult = await buildDocumentContext(
@@ -287,16 +367,16 @@ export async function processPdfTranslationV2Job(
       });
     }
 
-    const translatedLayouts: PdfPageLayout[] = [];
+    const translatedLayouts: StoredPdfPageLayout[] = [];
     for (let index = 0; index < sourceLayouts.length; index += 1) {
       const source = sourceLayouts[index];
       const pageNumber = source.pageNumber;
       const current = await esgPrisma.pdf_translation_v2_pages.findUnique({
         where: { job_id_page_number: { job_id: job.id, page_number: pageNumber } },
       });
-      const storedTranslation = parseLayout(current?.translated_layout);
+      const storedTranslation = parseStoredPdfPageLayout(current?.translated_layout);
       if (current?.status === 'translated' && storedTranslation) {
-        translatedLayouts.push(storedTranslation);
+        translatedLayouts.push(withPhysicalPageSize(storedTranslation, pagePdfs[index]));
         continue;
       }
 
@@ -324,7 +404,7 @@ export async function processPdfTranslationV2Job(
         throw error;
       }
       await throwIfJobCancelled(job.id, job.leaseOwner);
-      const merged = mergePageTranslation(source, translated.translation);
+      const merged = mergePageTranslation(source, translated.translation) as StoredPdfPageLayout;
       translatedLayouts.push(merged);
       await esgPrisma.pdf_translation_v2_pages.update({
         where: { job_id_page_number: { job_id: job.id, page_number: pageNumber } },
@@ -344,7 +424,7 @@ export async function processPdfTranslationV2Job(
     }
 
     await reportProgress(94, 'rendering', 'Rendering translated tables and text…');
-    await renderPdfxV2Document(translatedLayouts, outputPath);
+    await renderPdfxV2Document(translatedLayouts, outputPath, job.inputData);
     const outputPdf = await fs.readFile(outputPath);
 
     const usage = await esgPrisma.pdf_translation_v2_pages.aggregate({
@@ -357,14 +437,21 @@ export async function processPdfTranslationV2Job(
       pageOutputTokens: usage._sum.output_tokens ?? 0,
       sourcePages: sourceLayouts.length,
       translator: 'openai-structured-v2',
+      pipelineVersion: PDFX_V2_PIPELINE_VERSION,
+      model: PDFX_V2_MODEL,
+      rendererVersion: PDFX_V2_RENDERER_VERSION,
     };
     const result = {
       pages: sourceLayouts.length,
       translator: 'openai-structured-v2',
       targetLanguage: job.payload.targetLang,
+      pipelineVersion: PDFX_V2_PIPELINE_VERSION,
+      model: PDFX_V2_MODEL,
+      rendererVersion: PDFX_V2_RENDERER_VERSION,
     };
     await throwIfJobCancelled(job.id, job.leaseOwner);
     await completePdfTranslationV2Job(job.id, job.userId, job.leaseOwner, {
+      jobType: job.jobType,
       outputPdf,
       metrics,
       result,

@@ -1,10 +1,9 @@
 import { NextResponse } from 'next/server';
 import { PDFDocument } from 'pdf-lib';
-import { enforceApiUsage } from '@/lib/api-usage';
 import { JobConcurrencyLimitError } from '@/lib/jobs/queue';
 import { MAX_PDF_REQUEST_BYTES, MAX_PDF_UPLOAD_BYTES } from '@/lib/pdfx-v2/constants';
 import { requirePdfxUser } from '@/lib/pdfx-v2/auth';
-import { MAX_PDF_PAGES, normalizePdfDisplayName } from '@/lib/pdfx-v2/file-policy';
+import { normalizePdfDisplayName } from '@/lib/pdfx-v2/file-policy';
 import { startPdfTranslationV2Job } from '@/lib/pdfx-v2/pipeline';
 import { isPdfxV2TargetLanguage } from '@/lib/pdfx-v2/types';
 
@@ -79,7 +78,7 @@ export async function POST(request: Request) {
     }
     if (file.size < 1 || file.size > MAX_PDF_UPLOAD_BYTES) {
       const status = file.size > MAX_PDF_UPLOAD_BYTES ? 413 : 400;
-      return NextResponse.json({ error: 'PDF must be between 1 byte and 20 MB' }, { status });
+      return NextResponse.json({ error: 'PDF must be between 1 byte and 512 MB' }, { status });
     }
     if (file.type && file.type !== 'application/pdf') {
       return NextResponse.json({ error: 'Only PDF files are accepted' }, { status: 415 });
@@ -95,24 +94,9 @@ export async function POST(request: Request) {
     } catch {
       return NextResponse.json({ error: 'PDF is malformed or encrypted' }, { status: 422 });
     }
-    if (pageCount < 1 || pageCount > MAX_PDF_PAGES) {
-      return NextResponse.json(
-        { error: `PDF must contain between 1 and ${MAX_PDF_PAGES} pages` },
-        { status: 422 },
-      );
+    if (pageCount < 1) {
+      return NextResponse.json({ error: 'PDF must contain at least one page' }, { status: 422 });
     }
-
-    const limited = await enforceApiUsage(request, {
-      feature: 'pdf_translation_v2',
-      userId: auth.userId,
-      perMinute: 2,
-      perDay: 10,
-      dailyCostUnits: 300,
-      costUnits: pageCount,
-      maxConcurrentJobs: 1,
-      jobType: 'pdf_translation_v2',
-    });
-    if (limited) return limited;
 
     const filename = normalizePdfDisplayName(file.name, 'openai-translation');
     const jobId = await startPdfTranslationV2Job({
@@ -125,7 +109,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ success: true, jobId, pageCount });
   } catch (error) {
     if (error instanceof PdfRequestTooLargeError) {
-      return NextResponse.json({ error: 'PDF exceeds the 20 MB limit' }, { status: 413 });
+      return NextResponse.json({ error: 'PDF exceeds the 512 MB upload maximum' }, { status: 413 });
     }
     if (error instanceof JobConcurrencyLimitError) {
       return NextResponse.json({ error: error.message }, { status: 429 });

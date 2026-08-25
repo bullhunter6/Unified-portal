@@ -25,7 +25,11 @@ import {
   throwIfJobCancelled,
   type ClaimedBackgroundJob,
 } from "@/lib/jobs/queue";
-import { processPdfTranslationV2Job } from "@/lib/pdfx-v2/pipeline";
+import {
+  PDF_TRANSLATION_MAX_ATTEMPTS,
+  processPdfTranslationV2Job,
+} from "@/lib/pdfx-v2/pipeline";
+import { isPdfxV2QueueJobType } from "@/lib/pdfx-v2/constants";
 import {
   createTransientPollState,
   pollWithTransientBackoff,
@@ -68,7 +72,13 @@ async function main(): Promise<void> {
             workerId,
             availableSlots,
             90,
-            ["esg_driver", "pdf_translation_v2"],
+            [
+              "esg_driver",
+              "pdf_translation_v2",
+              "pdf_translation_v3",
+              "pdf_translation_v4",
+              "pdf_translation_v5",
+            ],
             "generic",
           ),
           isTransientPrismaConnectivityError,
@@ -161,7 +171,7 @@ async function executeJob(job: ClaimedBackgroundJob): Promise<void> {
   try {
     const output = job.jobType === "esg_driver"
       ? await runEsgDriverGenerationJob(job as any)
-      : job.jobType === "pdf_translation_v2"
+      : isPdfxV2QueueJobType(job.jobType)
         ? await processPdfTranslationV2Job(job as any)
         : (() => {
             throw new Error(`Unsupported job type for worker: ${job.jobType}`);
@@ -180,7 +190,7 @@ async function executeJob(job: ClaimedBackgroundJob): Promise<void> {
       const transitioned = job.jobType === "esg_driver"
         ? await markEsgDriverJobCancelled(job.id, job.leaseOwner)
         : await markBackgroundJobCancelled(job.id, job.leaseOwner);
-      if (transitioned && job.jobType === "pdf_translation_v2") {
+      if (transitioned && isPdfxV2QueueJobType(job.jobType)) {
         await synchronizePdfV2DomainJob(job, "cancelled", "Cancelled");
       }
       if (!transitioned) {
@@ -198,16 +208,21 @@ async function executeJob(job: ClaimedBackgroundJob): Promise<void> {
       ? await failEsgDriverJob(job, message, {
           retryable: isRetryableEsgDriverFailure(error),
         })
-      : await failBackgroundJob(job, message);
+      : await failBackgroundJob(job, message, {
+          minimumAttempts: PDF_TRANSLATION_MAX_ATTEMPTS,
+          keepRetrying: true,
+        });
     if (!transition.transitioned) {
       console.warn(`[esg-driver-worker] failure lease lost for ${job.id}`);
       return;
     }
-    if (job.jobType === "pdf_translation_v2") {
+    if (isPdfxV2QueueJobType(job.jobType)) {
       await synchronizePdfV2DomainJob(
         job,
         transition.status === "error" ? "error" : "queued",
-        transition.status === "error" ? message : "Retry scheduled",
+        transition.status === "error"
+          ? "Translation could not continue automatically. Please contact support; completed pages were retained."
+          : "This page needs another accuracy pass. Retrying automatically…",
       );
     }
     console.error(

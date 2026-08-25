@@ -81,6 +81,9 @@ importers:
       '@mendable/firecrawl-js':
         specifier: ^4.6.1
         version: 4.6.1
+      '@napi-rs/canvas':
+        specifier: 0.1.100
+        version: 0.1.100
       '@pdf-lib/fontkit':
         specifier: ^1.1.1
         version: 1.1.1
@@ -5809,7 +5812,6 @@ snapshots:
       '@napi-rs/canvas-linux-x64-musl': 0.1.100
       '@napi-rs/canvas-win32-arm64-msvc': 0.1.100
       '@napi-rs/canvas-win32-x64-msvc': 0.1.100
-    optional: true
 
   '@napi-rs/wasm-runtime@0.2.12':
     dependencies:

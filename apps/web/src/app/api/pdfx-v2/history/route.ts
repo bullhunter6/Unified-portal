@@ -31,7 +31,13 @@ export async function GET(request: Request) {
     esgPrisma.pdf_translation_v2_jobs.count({ where: { user_id: auth.userId } }),
   ]);
   const response = NextResponse.json({
-    items: items.map((item) => ({ ...item, canDownload: item.status === 'completed' })),
+    items: items.map((item) => ({
+      ...item,
+      message: item.status === 'error'
+        ? 'Translation could not continue automatically. Please contact support; completed pages were retained.'
+        : item.message,
+      canDownload: item.status === 'completed',
+    })),
     total,
     page: pagination.page,
     size: pagination.pageSize,

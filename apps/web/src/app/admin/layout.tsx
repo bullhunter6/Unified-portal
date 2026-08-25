@@ -20,6 +20,7 @@ export default function AdminLayout({
     { name: "Tender Scraper", href: "/admin/tenders", icon: "📋" },
     { name: "Tender Monitor", href: "/admin/tender-monitor", icon: "TM" },
     { name: "AI Assistant Stats", href: "/admin/ai-assistant", icon: "🤖" },
+    { name: "PDF Translator", href: "/admin/pdf-translator", icon: "PDF" },
     { name: "Alert Management", href: "/admin/alerts", icon: "🔔" },
     { name: "Email Queue", href: "/admin/email-queue", icon: "📧" },
     { name: "Event Email Alerts", href: "/admin/events-email-alerts", icon: "EV" },
